@@ -155,12 +155,22 @@ pub fn generate_map() -> Map {
 // ── Startup system: spawn isometric tile sprites ──────────────────────────────
 
 fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<AssetServer>) {
-    let floor_tex: Handle<Image> = asset_server.load("Isometric/planks_N.png");
-    let wall_tex: Handle<Image> = asset_server.load("Isometric/stoneColumn_N.png");
+    let floor_variants: [Handle<Image>; 4] = [
+        asset_server.load("Isometric/stone_N.png"),
+        asset_server.load("Isometric/stone_E.png"),
+        asset_server.load("Isometric/stone_S.png"),
+        asset_server.load("Isometric/stone_W.png"),
+    ];
+    let wall_n: Handle<Image> = asset_server.load("Isometric/stoneWall_N.png");
+    let wall_s: Handle<Image> = asset_server.load("Isometric/stoneWall_S.png");
+    let wall_e: Handle<Image> = asset_server.load("Isometric/stoneWall_E.png");
+    let wall_w: Handle<Image> = asset_server.load("Isometric/stoneWall_W.png");
 
     // Anchor that places the sprite's isometric diamond center at the world pos.
     // In the ~256×320 tile images, the diamond center sits ~30% below image center.
     let floor_anchor = Anchor::Custom(Vec2::new(0.0, -0.30));
+
+    let mut rng = rand::thread_rng();
 
     for y in 0..map.height {
         for x in 0..map.width {
@@ -172,9 +182,10 @@ fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<Asse
 
             match map.tiles[map.idx(x, y)] {
                 TileType::Floor => {
+                    let variant = rng.gen_range(0..floor_variants.len());
                     commands.spawn((
                         Sprite {
-                            image: floor_tex.clone(),
+                            image: floor_variants[variant].clone(),
                             anchor: floor_anchor,
                             ..Default::default()
                         },
@@ -183,26 +194,30 @@ fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<Asse
                     ));
                 }
                 TileType::Wall => {
-                    // Only place a column where the wall borders at least one floor
-                    // tile — avoids filling the entire void with columns.
-                    let borders_floor = [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)]
-                        .iter()
-                        .any(|&(dx, dy)| map.is_walkable(x + dx, y + dy));
+                    // Select wall face based on which cardinal neighbour is walkable.
+                    // Floor to the south → N face visible; floor to the east → W face, etc.
+                    let wall_tex = if map.is_walkable(x, y + 1) {
+                        wall_n.clone()
+                    } else if map.is_walkable(x, y - 1) {
+                        wall_s.clone()
+                    } else if map.is_walkable(x + 1, y) {
+                        wall_w.clone()
+                    } else if map.is_walkable(x - 1, y) {
+                        wall_e.clone()
+                    } else {
+                        continue; // interior void — skip
+                    };
 
-                    if borders_floor {
-                        commands.spawn((
-                            YSort,
-                            Sprite {
-                                image: wall_tex.clone(),
-                                // Bottom of the column image sits at the tile's
-                                // isometric grid position so it rises from the floor.
-                                anchor: Anchor::BottomCenter,
-                                ..Default::default()
-                            },
-                            Transform::from_xyz(wx, wy, 0.0)
-                                .with_scale(Vec3::splat(TILE_SCALE)),
-                        ));
-                    }
+                    commands.spawn((
+                        YSort,
+                        Sprite {
+                            image: wall_tex,
+                            anchor: Anchor::BottomCenter,
+                            ..Default::default()
+                        },
+                        Transform::from_xyz(wx, wy, 0.0)
+                            .with_scale(Vec3::splat(TILE_SCALE)),
+                    ));
                 }
             }
         }

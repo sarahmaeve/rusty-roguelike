@@ -4,12 +4,101 @@ use bevy_light_2d::prelude::*;
 use crate::{
     components::{MapPosition, Player, YSort},
     map::Map,
-    ISO_STEP_X, ISO_STEP_Y,
+    ISO_STEP_X, ISO_STEP_Y, TILE_SCALE,
 };
+
+const RUN_FRAME_COUNT: usize = 10;
+/// Seconds per run animation frame (≈10 fps).
+const RUN_FRAME_SECS: f32 = 0.1;
+
+// ── Facing direction ──────────────────────────────────────────────────────────
+
+/// Last movement direction, used to pick the correct directional sprite set.
+///
+/// Screen-space directions for this isometric projection:
+///   East  (dx=+1) → screen SE  — Male_1 frames, flip_x=false
+///   West  (dx=-1) → screen NW  — Male_1 frames, flip_x=true  (mirrored)
+///   South (dy=+1) → screen SW  — Male_3 frames (toward viewer)
+///   North (dy=-1) → screen NE  — Male_0 frames (away from viewer)
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum FacingDir {
+    East,
+    West,
+    #[default]
+    South,
+    North,
+}
+
+// ── Animation components ──────────────────────────────────────────────────────
+
+/// Per-direction sprite sets. West mirrors East via `flip_x`.
+#[derive(Component)]
+struct PlayerSprites {
+    north_idle: Handle<Image>,
+    north_run: [Handle<Image>; RUN_FRAME_COUNT],
+    east_idle: Handle<Image>,
+    east_run: [Handle<Image>; RUN_FRAME_COUNT],
+    south_idle: Handle<Image>,
+    south_run: [Handle<Image>; RUN_FRAME_COUNT],
+}
+
+#[derive(Component)]
+struct PlayerAnimation {
+    facing: FacingDir,
+    running: bool,
+    frame: usize,
+    /// Advances through run frames while running.
+    frame_timer: Timer,
+    /// Reset on each step; idle resumes when this expires.
+    run_cooldown: Timer,
+}
+
+impl PlayerAnimation {
+    fn new() -> Self {
+        Self {
+            facing: FacingDir::default(),
+            running: false,
+            frame: 0,
+            frame_timer: Timer::from_seconds(RUN_FRAME_SECS, TimerMode::Repeating),
+            run_cooldown: Timer::from_seconds(
+                RUN_FRAME_SECS * RUN_FRAME_COUNT as f32,
+                TimerMode::Once,
+            ),
+        }
+    }
+
+    /// Call when the player takes a step to (re)start the run animation.
+    fn trigger(&mut self, facing: FacingDir) {
+        self.facing = facing;
+        self.running = true;
+        self.run_cooldown.reset();
+    }
+}
 
 // ── Startup system: spawn the player ─────────────────────────────────────────
 
-fn spawn_player(mut commands: Commands, map: Res<Map>) {
+fn spawn_player(
+    mut commands: Commands,
+    map: Res<Map>,
+    asset_server: Res<AssetServer>,
+) {
+    let load_run = |variant: u8| -> [Handle<Image>; RUN_FRAME_COUNT] {
+        std::array::from_fn(|i| {
+            asset_server.load(format!("Characters/Male/Male_{variant}_Run{i}.png"))
+        })
+    };
+
+    let sprites = PlayerSprites {
+        north_idle: asset_server.load("Characters/Male/Male_0_Idle0.png"),
+        north_run: load_run(0),
+        east_idle: asset_server.load("Characters/Male/Male_1_Idle0.png"),
+        east_run: load_run(1),
+        south_idle: asset_server.load("Characters/Male/Male_3_Idle0.png"),
+        south_run: load_run(3),
+    };
+    // Default facing is South; start with the south idle sprite.
+    let initial_idle = sprites.south_idle.clone();
+
     let (cx, cy) = map.rooms[0].center();
     let pos = MapPosition::new(cx, cy);
     let world = pos.to_world(0.0);
@@ -19,12 +108,13 @@ fn spawn_player(mut commands: Commands, map: Res<Map>) {
             Player,
             YSort,
             pos,
+            sprites,
+            PlayerAnimation::new(),
             Sprite {
-                color: Color::srgb(0.9, 0.8, 0.1),
-                custom_size: Some(Vec2::splat(ISO_STEP_X * 0.6)),
+                image: initial_idle,
                 ..Default::default()
             },
-            Transform::from_xyz(world.x, world.y, 0.0),
+            Transform::from_xyz(world.x, world.y, 0.0).with_scale(Vec3::splat(TILE_SCALE)),
             PointLight2d {
                 radius: 350.0,
                 intensity: 3.5,
@@ -51,9 +141,9 @@ fn spawn_player(mut commands: Commands, map: Res<Map>) {
 fn player_movement(
     keyboard: Res<ButtonInput<KeyCode>>,
     map: Res<Map>,
-    mut query: Query<(&mut MapPosition, &mut Transform), With<Player>>,
+    mut query: Query<(&mut MapPosition, &mut Transform, &mut PlayerAnimation), With<Player>>,
 ) {
-    let Ok((mut pos, mut transform)) = query.get_single_mut() else {
+    let Ok((mut pos, mut transform, mut anim)) = query.get_single_mut() else {
         return;
     };
 
@@ -74,6 +164,15 @@ fn player_movement(
         return;
     }
 
+    // Determine facing before attempting move so the sprite updates even on
+    // a blocked step (gives the player feedback that input was received).
+    let facing = match (dx, dy) {
+        (1, _)  => FacingDir::East,
+        (-1, _) => FacingDir::West,
+        (_, 1)  => FacingDir::South,
+        _       => FacingDir::North,
+    };
+
     let new_x = pos.x + dx;
     let new_y = pos.y + dy;
 
@@ -84,6 +183,48 @@ fn player_movement(
         // Z is managed by y_sort each frame; only update X/Y here.
         transform.translation.x = world.x;
         transform.translation.y = world.y;
+        anim.trigger(facing);
+    } else {
+        // Wall bump: update facing without triggering run animation.
+        anim.facing = facing;
+    }
+}
+
+// ── Update system: drive the sprite animation ─────────────────────────────────
+
+fn animate_player(
+    time: Res<Time>,
+    mut query: Query<(&mut Sprite, &mut PlayerAnimation, &PlayerSprites), With<Player>>,
+) {
+    let Ok((mut sprite, mut anim, sprites)) = query.get_single_mut() else {
+        return;
+    };
+
+    if anim.running {
+        anim.run_cooldown.tick(time.delta());
+        if anim.run_cooldown.finished() {
+            anim.running = false;
+            anim.frame = 0;
+        }
+    }
+
+    // West mirrors East with a horizontal flip.
+    sprite.flip_x = anim.facing == FacingDir::West;
+
+    let (idle, run) = match anim.facing {
+        FacingDir::North => (&sprites.north_idle, &sprites.north_run),
+        FacingDir::East | FacingDir::West => (&sprites.east_idle, &sprites.east_run),
+        FacingDir::South => (&sprites.south_idle, &sprites.south_run),
+    };
+
+    if anim.running {
+        anim.frame_timer.tick(time.delta());
+        if anim.frame_timer.just_finished() {
+            anim.frame = (anim.frame + 1) % RUN_FRAME_COUNT;
+        }
+        sprite.image = run[anim.frame].clone();
+    } else {
+        sprite.image = idle.clone();
     }
 }
 
@@ -94,6 +235,6 @@ pub struct PlayerPlugin;
 impl Plugin for PlayerPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, spawn_player)
-            .add_systems(Update, player_movement);
+            .add_systems(Update, (player_movement, animate_player));
     }
 }
