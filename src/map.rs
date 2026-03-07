@@ -165,6 +165,15 @@ fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<Asse
     let wall_s: Handle<Image> = asset_server.load("Isometric/stoneWall_S.png");
     let wall_e: Handle<Image> = asset_server.load("Isometric/stoneWall_E.png");
     let wall_w: Handle<Image> = asset_server.load("Isometric/stoneWall_W.png");
+    // Corner pieces — each covers two perpendicular wall faces:
+    //   corner_N: floor south (dy+1) AND east (dx+1)
+    //   corner_E: floor south (dy+1) AND west (dx-1)
+    //   corner_S: floor north (dy-1) AND west (dx-1)
+    //   corner_W: floor north (dy-1) AND east (dx+1)
+    let corner_n: Handle<Image> = asset_server.load("Isometric/stoneWallCorner_N.png");
+    let corner_s: Handle<Image> = asset_server.load("Isometric/stoneWallCorner_S.png");
+    let corner_e: Handle<Image> = asset_server.load("Isometric/stoneWallCorner_E.png");
+    let corner_w: Handle<Image> = asset_server.load("Isometric/stoneWallCorner_W.png");
 
     // Anchor that places the sprite's isometric diamond center at the world pos.
     // In the ~256×320 tile images, the diamond center sits ~30% below image center.
@@ -194,19 +203,23 @@ fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<Asse
                     ));
                 }
                 TileType::Wall => {
-                    // Select wall face based on which cardinal neighbour is walkable.
-                    // Floor to the south → N face visible; floor to the east → W face, etc.
-                    let wall_tex = if map.is_walkable(x, y + 1) {
-                        wall_n.clone()
-                    } else if map.is_walkable(x, y - 1) {
-                        wall_s.clone()
-                    } else if map.is_walkable(x + 1, y) {
-                        wall_w.clone()
-                    } else if map.is_walkable(x - 1, y) {
-                        wall_e.clone()
-                    } else {
-                        continue; // interior void — skip
-                    };
+                    let s = map.is_walkable(x, y + 1);
+                    let n = map.is_walkable(x, y - 1);
+                    let e = map.is_walkable(x + 1, y);
+                    let w = map.is_walkable(x - 1, y);
+
+                    // Corner pieces take priority — they cover two perpendicular faces
+                    // and fill the visual gap that occurs where two wall runs meet.
+                    // Falls through to single-face walls, then skips interior voids.
+                    let wall_tex = if s && e { corner_n.clone() }
+                    else if s && w           { corner_e.clone() }
+                    else if n && w           { corner_s.clone() }
+                    else if n && e           { corner_w.clone() }
+                    else if s                { wall_n.clone() }
+                    else if n                { wall_s.clone() }
+                    else if e                { wall_w.clone() }
+                    else if w                { wall_e.clone() }
+                    else                     { continue; }; // interior void — skip
 
                     commands.spawn((
                         YSort,
