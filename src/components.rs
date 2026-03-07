@@ -9,7 +9,8 @@ pub struct Player;
 pub struct MainCamera;
 
 /// Any entity with this component will have its Z updated each frame based on
-/// its world Y position, creating correct painter's-algorithm depth ordering.
+/// its world Y position, giving correct painter's-algorithm depth ordering for
+/// the isometric view (lower on screen = higher Z = rendered in front).
 #[derive(Component)]
 pub struct YSort;
 
@@ -25,12 +26,57 @@ impl MapPosition {
         Self { x, y }
     }
 
-    /// Convert tile coords to a world-space Vec3 at the given Z layer.
+    /// Convert tile grid coords to isometric world-space Vec3.
+    ///
+    /// Projection:
+    ///   world_x = (col - row) * ISO_STEP_X
+    ///   world_y = -(col + row) * ISO_STEP_Y
     pub fn to_world(&self, z: f32) -> Vec3 {
         Vec3::new(
-            self.x as f32 * crate::TILE_SIZE,
-            self.y as f32 * crate::TILE_SIZE,
+            (self.x as f32 - self.y as f32) * crate::ISO_STEP_X,
+            -(self.x as f32 + self.y as f32) * crate::ISO_STEP_Y,
             z,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_world_origin() {
+        let pos = MapPosition::new(0, 0);
+        let w = pos.to_world(0.0);
+        assert_eq!(w.x, 0.0);
+        assert_eq!(w.y, 0.0);
+        assert_eq!(w.z, 0.0);
+    }
+
+    #[test]
+    fn to_world_col_step() {
+        // Moving one column right → right and down on screen.
+        let pos = MapPosition::new(1, 0);
+        let w = pos.to_world(0.0);
+        assert_eq!(w.x, crate::ISO_STEP_X);
+        assert_eq!(w.y, -crate::ISO_STEP_Y);
+    }
+
+    #[test]
+    fn to_world_row_step() {
+        // Moving one row down → left and down on screen.
+        let pos = MapPosition::new(0, 1);
+        let w = pos.to_world(0.0);
+        assert_eq!(w.x, -crate::ISO_STEP_X);
+        assert_eq!(w.y, -crate::ISO_STEP_Y);
+    }
+
+    #[test]
+    fn to_world_diagonal_cancels_x() {
+        // Equal col and row → world_x cancels to 0, world_y doubles.
+        let pos = MapPosition::new(3, 3);
+        let w = pos.to_world(0.0);
+        assert_eq!(w.x, 0.0);
+        assert_eq!(w.y, -6.0 * crate::ISO_STEP_Y);
     }
 }

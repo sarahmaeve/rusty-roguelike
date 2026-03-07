@@ -5,16 +5,21 @@ use crate::components::{MainCamera, Player};
 
 const CAMERA_LERP_SPEED: f32 = 0.1;
 
-// ── Startup system: spawn the 2D camera ──────────────────────────────────────
+// ── Startup system: spawn the isometric camera ───────────────────────────────
 
 fn spawn_camera(mut commands: Commands) {
     commands.spawn((
         MainCamera,
         Camera2d::default(),
-        // Near-black ambient so the player's torch is the dominant light source.
+        OrthographicProjection {
+            // Zoom out slightly so the player sees more of the dungeon.
+            scale: 0.6,
+            ..OrthographicProjection::default_2d()
+        },
+        // Near-black ambient; the player's torch is the dominant light source.
         AmbientLight2d {
             brightness: 0.06,
-            color: Color::srgb(0.6, 0.65, 1.0), // faint cool blue tint for darkness
+            color: Color::srgb(0.6, 0.65, 1.0),
         },
     ));
 }

@@ -4,17 +4,15 @@ use bevy_light_2d::prelude::*;
 use crate::{
     components::{MapPosition, Player, YSort},
     map::Map,
-    TILE_SIZE,
+    ISO_STEP_X, ISO_STEP_Y,
 };
 
 // ── Startup system: spawn the player ─────────────────────────────────────────
 
 fn spawn_player(mut commands: Commands, map: Res<Map>) {
-    // Start in the centre of the first generated room.
     let (cx, cy) = map.rooms[0].center();
     let pos = MapPosition::new(cx, cy);
-    let wx = cx as f32 * TILE_SIZE;
-    let wy = cy as f32 * TILE_SIZE;
+    let world = pos.to_world(0.0);
 
     commands
         .spawn((
@@ -23,13 +21,12 @@ fn spawn_player(mut commands: Commands, map: Res<Map>) {
             pos,
             Sprite {
                 color: Color::srgb(0.9, 0.8, 0.1),
-                custom_size: Some(Vec2::splat(TILE_SIZE * 0.75)),
+                custom_size: Some(Vec2::splat(ISO_STEP_X * 0.6)),
                 ..Default::default()
             },
-            Transform::from_xyz(wx, wy, 0.0),
-            // Torch carried by the player — warm point light.
+            Transform::from_xyz(world.x, world.y, 0.0),
             PointLight2d {
-                radius: 220.0,
+                radius: 350.0,
                 intensity: 3.5,
                 color: Color::srgb(1.0, 0.82, 0.45),
                 cast_shadows: false,
@@ -37,15 +34,14 @@ fn spawn_player(mut commands: Commands, map: Res<Map>) {
             },
         ))
         .with_children(|parent| {
-            // Drop shadow: a semi-transparent ellipse below the player's feet.
+            // Isometric drop shadow: a flattened ellipse below the player sprite.
             parent.spawn((
                 Sprite {
                     color: Color::srgba(0.0, 0.0, 0.0, 0.45),
-                    custom_size: Some(Vec2::new(TILE_SIZE * 0.7, TILE_SIZE * 0.22)),
+                    custom_size: Some(Vec2::new(ISO_STEP_X * 0.6, ISO_STEP_Y * 0.3)),
                     ..Default::default()
                 },
-                // Offset downward, and slightly behind the player sprite.
-                Transform::from_xyz(0.0, -TILE_SIZE * 0.32, -0.01),
+                Transform::from_xyz(0.0, -ISO_STEP_Y * 0.5, -0.01),
             ));
         });
 }
@@ -84,9 +80,10 @@ fn player_movement(
     if map.is_walkable(new_x, new_y) {
         pos.x = new_x;
         pos.y = new_y;
-        // Only update X/Y — Z is managed by the y_sort system.
-        transform.translation.x = new_x as f32 * TILE_SIZE;
-        transform.translation.y = new_y as f32 * TILE_SIZE;
+        let world = pos.to_world(0.0);
+        // Z is managed by y_sort each frame; only update X/Y here.
+        transform.translation.x = world.x;
+        transform.translation.y = world.y;
     }
 }
 

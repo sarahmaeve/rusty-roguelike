@@ -1,13 +1,13 @@
 use bevy::{prelude::*, sprite::Anchor};
 use rand::Rng;
 
-use crate::{components::YSort, MAP_HEIGHT, MAP_WIDTH, TILE_SIZE};
+use crate::{components::YSort, ISO_STEP_X, ISO_STEP_Y, MAP_HEIGHT, MAP_WIDTH, TILE_SCALE};
 
 // ── Dungeon generation tunables ───────────────────────────────────────────────
 
-const MAX_ROOMS: usize = 15;
-const MIN_ROOM_SIZE: i32 = 4;
-const MAX_ROOM_SIZE: i32 = 12;
+const MAX_ROOMS: usize = 12;
+const MIN_ROOM_SIZE: i32 = 3;
+const MAX_ROOM_SIZE: i32 = 8;
 
 // ── Tile type ─────────────────────────────────────────────────────────────────
 
@@ -81,8 +81,6 @@ impl Map {
         self.in_bounds(x, y) && self.tiles[self.idx(x, y)] == TileType::Floor
     }
 
-    // ── Carving helpers ───────────────────────────────────────────────────────
-
     fn carve_room(&mut self, room: &Rect) {
         for y in (room.y1 + 1)..room.y2 {
             for x in (room.x1 + 1)..room.x2 {
@@ -93,7 +91,6 @@ impl Map {
     }
 
     fn carve_h_corridor(&mut self, x1: i32, x2: i32, y: i32) {
-        // 3 tiles tall so the player is never occluded by adjacent walls.
         for x in x1.min(x2)..=x1.max(x2) {
             for dy in -1..=1_i32 {
                 if self.in_bounds(x, y + dy) {
@@ -105,7 +102,6 @@ impl Map {
     }
 
     fn carve_v_corridor(&mut self, y1: i32, y2: i32, x: i32) {
-        // 3 tiles wide so the player is never occluded by adjacent walls.
         for y in y1.min(y2)..=y1.max(y2) {
             for dx in -1..=1_i32 {
                 if self.in_bounds(x + dx, y) {
@@ -119,7 +115,6 @@ impl Map {
 
 // ── Dungeon generator ─────────────────────────────────────────────────────────
 
-/// Builds a rooms-and-corridors dungeon procedurally.
 pub fn generate_map() -> Map {
     let mut map = Map::new();
     let mut rng = rand::thread_rng();
@@ -132,14 +127,12 @@ pub fn generate_map() -> Map {
 
         let new_room = Rect::new(x, y, w, h);
 
-        // Skip rooms that overlap an existing one.
         if map.rooms.iter().any(|r| r.intersects(&new_room)) {
             continue;
         }
 
         map.carve_room(&new_room);
 
-        // Connect to the previous room with an L-shaped corridor.
         if let Some(prev) = map.rooms.last() {
             let (px, py) = prev.center();
             let (nx, ny) = new_room.center();
@@ -159,70 +152,55 @@ pub fn generate_map() -> Map {
     map
 }
 
-// ── Startup system: spawn tile sprites ───────────────────────────────────────
+// ── Startup system: spawn isometric tile sprites ──────────────────────────────
 
-fn spawn_map_tiles(mut commands: Commands, map: Res<Map>) {
-    const WALL_FACE_COLOR: Color = Color::srgb(0.25, 0.18, 0.12);
-    const WALL_TOP_COLOR: Color = Color::srgb(0.38, 0.28, 0.18);
-    const FLOOR_COLOR: Color = Color::srgb(0.35, 0.32, 0.28);
-    // Floor tiles directly adjacent to a south-facing wall are slightly darker
-    // to approximate contact shadow / ambient occlusion.
-    const FLOOR_SHADOW_COLOR: Color = Color::srgb(0.22, 0.20, 0.18);
+fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<AssetServer>) {
+    let floor_tex: Handle<Image> = asset_server.load("Isometric/planks_N.png");
+    let wall_tex: Handle<Image> = asset_server.load("Isometric/stoneColumn_N.png");
+
+    // Anchor that places the sprite's isometric diamond center at the world pos.
+    // In the ~256×320 tile images, the diamond center sits ~30% below image center.
+    let floor_anchor = Anchor::Custom(Vec2::new(0.0, -0.30));
 
     for y in 0..map.height {
         for x in 0..map.width {
-            let wx = x as f32 * TILE_SIZE;
-            let wy = y as f32 * TILE_SIZE;
+            let wx = (x as f32 - y as f32) * ISO_STEP_X;
+            let wy = -(x as f32 + y as f32) * ISO_STEP_Y;
+            // Fixed depth for floor: higher col+row → higher z → in front of
+            // tiles farther from the viewer. Offset well below YSort objects.
+            let floor_z = (x + y) as f32 * 0.001 - 200.0;
 
             match map.tiles[map.idx(x, y)] {
                 TileType::Floor => {
-                    // Darken the floor tile if the wall immediately above it (y+1)
-                    // has a south-facing face — i.e. that wall will cast a shadow down.
-                    let in_wall_shadow = y + 1 < map.height
-                        && map.tiles[map.idx(x, y + 1)] == TileType::Wall;
-                    let color = if in_wall_shadow {
-                        FLOOR_SHADOW_COLOR
-                    } else {
-                        FLOOR_COLOR
-                    };
-
                     commands.spawn((
                         Sprite {
-                            color,
-                            custom_size: Some(Vec2::splat(TILE_SIZE)),
+                            image: floor_tex.clone(),
+                            anchor: floor_anchor,
                             ..Default::default()
                         },
-                        Transform::from_xyz(wx, wy, -1.0),
+                        Transform::from_xyz(wx, wy, floor_z)
+                            .with_scale(Vec3::splat(TILE_SCALE)),
                     ));
                 }
                 TileType::Wall => {
-                    // Top surface — always visible from above, sits flat at tile level.
-                    commands.spawn((
-                        Sprite {
-                            color: WALL_TOP_COLOR,
-                            custom_size: Some(Vec2::splat(TILE_SIZE)),
-                            ..Default::default()
-                        },
-                        Transform::from_xyz(wx, wy, -0.5),
-                    ));
+                    // Only place a column where the wall borders at least one floor
+                    // tile — avoids filling the entire void with columns.
+                    let borders_floor = [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)]
+                        .iter()
+                        .any(|&(dx, dy)| map.is_walkable(x + dx, y + dy));
 
-                    // South face — only rendered when this wall borders a floor tile
-                    // below it. In a top-down view this is the only face the viewer
-                    // can see; rendering it everywhere would occlude narrow corridors.
-                    let has_south_face = y > 0
-                        && map.tiles[map.idx(x, y - 1)] == TileType::Floor;
-
-                    if has_south_face {
+                    if borders_floor {
                         commands.spawn((
                             YSort,
                             Sprite {
-                                color: WALL_FACE_COLOR,
-                                custom_size: Some(Vec2::new(TILE_SIZE, TILE_SIZE * 1.5)),
-                                anchor: Anchor::TopCenter,
+                                image: wall_tex.clone(),
+                                // Bottom of the column image sits at the tile's
+                                // isometric grid position so it rises from the floor.
+                                anchor: Anchor::BottomCenter,
                                 ..Default::default()
                             },
-                            // Position at the bottom edge of the wall tile, hang downward.
-                            Transform::from_xyz(wx, wy, 0.0),
+                            Transform::from_xyz(wx, wy, 0.0)
+                                .with_scale(Vec3::splat(TILE_SCALE)),
                         ));
                     }
                 }
@@ -240,5 +218,36 @@ impl Plugin for MapPlugin {
         let map = generate_map();
         app.insert_resource(map)
             .add_systems(Startup, spawn_map_tiles);
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_map_has_rooms() {
+        let map = generate_map();
+        assert!(!map.rooms.is_empty(), "dungeon must have at least one room");
+    }
+
+    #[test]
+    fn first_room_center_is_walkable() {
+        let map = generate_map();
+        let (cx, cy) = map.rooms[0].center();
+        assert!(map.is_walkable(cx, cy));
+    }
+
+    #[test]
+    fn map_bounds_correct() {
+        let map = generate_map();
+        assert!(!map.in_bounds(-1, 0));
+        assert!(!map.in_bounds(0, -1));
+        assert!(!map.in_bounds(MAP_WIDTH, 0));
+        assert!(!map.in_bounds(0, MAP_HEIGHT));
+        assert!(map.in_bounds(0, 0));
+        assert!(map.in_bounds(MAP_WIDTH - 1, MAP_HEIGHT - 1));
     }
 }
