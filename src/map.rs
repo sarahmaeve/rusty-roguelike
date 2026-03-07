@@ -212,7 +212,10 @@ fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<Asse
                         YSort,
                         Sprite {
                             image: wall_tex,
-                            anchor: Anchor::BottomCenter,
+                            // Same anchor as floor tiles: ground-contact line sits at
+                            // ~80% from the top of each wall image (20% from bottom),
+                            // matching the floor diamond centre convention.
+                            anchor: Anchor::Custom(Vec2::new(0.0, -0.30)),
                             ..Default::default()
                         },
                         Transform::from_xyz(wx, wy, 0.0)
