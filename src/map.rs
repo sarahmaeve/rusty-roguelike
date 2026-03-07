@@ -1,7 +1,10 @@
 use bevy::{prelude::*, sprite::Anchor};
 use rand::Rng;
 
-use crate::{components::YSort, ISO_STEP_X, ISO_STEP_Y, MAP_HEIGHT, MAP_WIDTH, TILE_SCALE};
+use crate::{
+    components::{MapPosition, Player, WallTile, YSort},
+    ISO_STEP_X, ISO_STEP_Y, MAP_HEIGHT, MAP_WIDTH, TILE_SCALE,
+};
 
 // ── Dungeon generation tunables ───────────────────────────────────────────────
 
@@ -223,6 +226,7 @@ fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<Asse
 
                     commands.spawn((
                         YSort,
+                        WallTile,
                         Sprite {
                             image: wall_tex,
                             // Same anchor as floor tiles: ground-contact line sits at
@@ -240,6 +244,49 @@ fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<Asse
     }
 }
 
+// ── Update system: fade walls that occlude the player ────────────────────────
+
+/// A wall at grid (x, y) occludes the player at (px, py) when:
+///   1. x + y > px + py  — the wall is closer to the viewer (higher z after YSort)
+///   2. |(x − y) − (px − py)| ≤ 1  — the wall shares the player's screen column
+///
+/// When occluding, the wall sprite alpha lerps down to OCCLUDED_ALPHA so the
+/// player remains visible without the wall disappearing entirely.
+fn fade_occluding_walls(
+    time: Res<Time>,
+    player_q: Query<&MapPosition, With<Player>>,
+    mut wall_q: Query<(&Transform, &mut Sprite), With<WallTile>>,
+) {
+    const OCCLUDED_ALPHA: f32 = 0.25;
+    const FADE_SPEED: f32 = 10.0; // alpha units per second
+
+    let Ok(player_pos) = player_q.get_single() else {
+        return;
+    };
+    let player_depth = player_pos.x + player_pos.y; // higher → closer to viewer
+    let player_col   = player_pos.x - player_pos.y; // isometric screen column
+
+    for (transform, mut sprite) in wall_q.iter_mut() {
+        // Recover integer grid coords from the world-space Transform.
+        // wx = (x − y) * ISO_STEP_X  →  x − y = wx / ISO_STEP_X
+        // wy = −(x + y) * ISO_STEP_Y  →  x + y = −wy / ISO_STEP_Y
+        let wall_depth = (-transform.translation.y / ISO_STEP_Y).round() as i32;
+        let wall_col   = ( transform.translation.x / ISO_STEP_X).round() as i32;
+
+        let target_alpha = if wall_depth > player_depth
+            && (wall_col - player_col).abs() <= 1
+        {
+            OCCLUDED_ALPHA
+        } else {
+            1.0
+        };
+
+        let current = sprite.color.alpha();
+        let next = current + (target_alpha - current) * (time.delta_secs() * FADE_SPEED).min(1.0);
+        sprite.color = sprite.color.with_alpha(next);
+    }
+}
+
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
 pub struct MapPlugin;
@@ -248,7 +295,8 @@ impl Plugin for MapPlugin {
     fn build(&self, app: &mut App) {
         let map = generate_map();
         app.insert_resource(map)
-            .add_systems(Startup, spawn_map_tiles);
+            .add_systems(Startup, spawn_map_tiles)
+            .add_systems(Update, fade_occluding_walls);
     }
 }
 

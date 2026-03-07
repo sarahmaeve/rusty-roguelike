@@ -14,6 +14,11 @@ pub struct MainCamera;
 #[derive(Component)]
 pub struct YSort;
 
+/// Marks a wall tile sprite so the occlusion system can fade it when it lies
+/// between the camera and the player.
+#[derive(Component)]
+pub struct WallTile;
+
 /// Discrete tile-grid position for any entity on the map.
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MapPosition {
