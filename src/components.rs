@@ -36,7 +36,7 @@ impl MapPosition {
     /// Projection:
     ///   world_x = (col - row) * ISO_STEP_X
     ///   world_y = -(col + row) * ISO_STEP_Y
-    pub fn to_world(&self, z: f32) -> Vec3 {
+    pub fn to_world(self, z: f32) -> Vec3 {
         Vec3::new(
             (self.x as f32 - self.y as f32) * crate::ISO_STEP_X,
             -(self.x as f32 + self.y as f32) * crate::ISO_STEP_Y,

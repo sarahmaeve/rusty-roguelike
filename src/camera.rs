@@ -10,7 +10,7 @@ const CAMERA_LERP_SPEED: f32 = 0.1;
 fn spawn_camera(mut commands: Commands) {
     commands.spawn((
         MainCamera,
-        Camera2d::default(),
+        Camera2d,
         OrthographicProjection {
             // Zoom out slightly so the player sees more of the dungeon.
             scale: 0.6,

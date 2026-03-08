@@ -37,6 +37,15 @@ struct CompassFg;
 #[derive(Component)]
 struct CompassLabel;
 
+// ── Type aliases ──────────────────────────────────────────────────────────────
+
+type ArmBgQuery<'w, 's> = Query<
+    'w,
+    's,
+    &'static mut BackgroundColor,
+    (With<CompassFg>, Without<CompassBg>, Without<CompassLabel>),
+>;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn fg(a: f32) -> Color {
@@ -163,7 +172,7 @@ fn update_compass_alpha(
     time: Res<Time>,
     mut state: ResMut<CompassAlpha>,
     mut bg_q: Query<&mut BackgroundColor, With<CompassBg>>,
-    mut fg_bg_q: Query<&mut BackgroundColor, (With<CompassFg>, Without<CompassBg>, Without<CompassLabel>)>,
+    mut fg_bg_q: ArmBgQuery,
     mut fg_text_q: Query<&mut TextColor, With<CompassFg>>,
 ) {
     let target = if moving.0 { MOVE_ALPHA } else { IDLE_ALPHA };
