@@ -53,14 +53,14 @@ const DOUBLE_CLICK_SECS: f32 = 0.3;
 // ── Lantern tunables ──────────────────────────────────────────────────────────
 
 /// Sprite brightness multiplier for `LightType::Dark` (0.4 = 40 %).
-const DARK_SPRITE_INTENSITY: f32 = 0.4;
+const DARK_SPRITE_INTENSITY: f32 = 0.5;
 
-const LANTERN_RADIUS: f32 = 120.0;
-const LANTERN_INTENSITY: f32 = 3.5;
+const LANTERN_RADIUS: f32 = 60.0;
+const LANTERN_INTENSITY: f32 = 2.5;
 /// Beam starts at 20 % less intensity than the lantern base.
 const BEAM_BASE_FACTOR: f32 = 0.80;
 /// Each additional segment reduces beam intensity by a further 10 %.
-const BEAM_DECAY: f32 = 0.90;
+const BEAM_DECAY: f32 = 0.70;
 /// Number of PointLight2d entities used to approximate the directional beam.
 const BEAM_SEGMENTS: usize = 8;
 /// World-space distance between consecutive beam-light centers.
@@ -174,8 +174,8 @@ impl LightType {
     fn next(self) -> Self {
         match self {
             Self::Torch   => Self::Lantern,
-            Self::Lantern => Self::Dark,
             Self::Dark    => Self::Torch,
+            Self::Lantern => Self::Dark,
         }
     }
 }
@@ -316,7 +316,7 @@ fn spawn_player(
                 radius: 0.0,
                 intensity: 0.0,
                 color: Color::srgb(1.0, 0.95, 0.7),
-                cast_shadows: false,
+                cast_shadows: true,
                 ..Default::default()
             },
             Transform::default(),
@@ -606,7 +606,8 @@ fn apply_light_type(
     match *light_type {
         LightType::Torch => {
             // flicker_torch drives the PointLight2d; just keep the sprite white.
-            sprite.color = Color::WHITE;
+            //sprite.color = Color::WHITE;
+            sprite.color = Color::srgb(1.0, 0.95, 0.2);
         }
         LightType::Lantern => {
             player_light.radius = LANTERN_RADIUS;
@@ -616,6 +617,7 @@ fn apply_light_type(
         LightType::Dark => {
             player_light.intensity = 0.0;
             player_light.radius = 0.0;
+            // sprite.color = Color::srgb(0.3, 0.7, 0.9);
             sprite.color = Color::srgb(DARK_SPRITE_INTENSITY, DARK_SPRITE_INTENSITY, DARK_SPRITE_INTENSITY);
         }
     }
