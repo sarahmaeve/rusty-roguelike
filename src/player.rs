@@ -21,31 +21,35 @@ const DOUBLE_CLICK_SECS: f32 = 0.3;
 
 /// Last movement direction, used to pick the correct directional sprite set.
 ///
-/// Screen-space directions for this isometric projection:
-///   East  (dx=+1) → screen SE  — Male_1 frames, flip_x=false
-///   West  (dx=-1) → screen NW  — Male_1 frames, flip_x=true  (mirrored)
-///   South (dy=+1) → screen SW  — Male_3 frames (toward viewer)
-///   North (dy=-1) → screen NE  — Male_0 frames (away from viewer)
+/// Asset mapping (first integer in filename = direction index):
+///   0 = North (dy=-1, dx=0)
+///   1 = NorthEast (dy=-1, dx=+1)
+///   2 = East (dx=+1, dy=0)
+///   3 = SouthEast (dy=+1, dx=+1)
+///   4 = South (dy=+1, dx=0)
+///   5 = SouthWest (dy=+1, dx=-1)
+///   6 = West (dx=-1, dy=0)
+///   7 = NorthWest (dy=-1, dx=-1)
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum FacingDir {
+    North,
+    NorthEast,
     East,
-    West,
+    SouthEast,
     #[default]
     South,
-    North,
+    SouthWest,
+    West,
+    NorthWest,
 }
 
 // ── Animation components ──────────────────────────────────────────────────────
 
-/// Per-direction sprite sets. West mirrors East via `flip_x`.
+/// Per-direction sprite sets for all 8 facing directions.
 #[derive(Component)]
 struct PlayerSprites {
-    north_idle: Handle<Image>,
-    north_run: [Handle<Image>; RUN_FRAME_COUNT],
-    east_idle: Handle<Image>,
-    east_run: [Handle<Image>; RUN_FRAME_COUNT],
-    south_idle: Handle<Image>,
-    south_run: [Handle<Image>; RUN_FRAME_COUNT],
+    idle: [Handle<Image>; 8],
+    run: [[Handle<Image>; RUN_FRAME_COUNT]; 8],
 }
 
 #[derive(Component)]
@@ -87,6 +91,13 @@ impl PlayerAnimation {
         self.run_cooldown.reset();
     }
 }
+
+// ── Public resources ──────────────────────────────────────────────────────────
+
+/// Set to `true` while the player's run animation is active; `false` when idle.
+/// Consumed by other plugins (e.g. HUD) to react to movement state.
+#[derive(Resource, Default)]
+pub struct PlayerMoving(pub bool);
 
 // ── Click-state resource ──────────────────────────────────────────────────────
 
@@ -143,21 +154,17 @@ fn spawn_player(
     map: Res<Map>,
     asset_server: Res<AssetServer>,
 ) {
-    let load_run = |variant: u8| -> [Handle<Image>; RUN_FRAME_COUNT] {
-        std::array::from_fn(|i| {
-            asset_server.load(format!("Characters/Male/Male_{variant}_Run{i}.png"))
-        })
-    };
-
     let sprites = PlayerSprites {
-        north_idle: asset_server.load("Characters/Male/Male_0_Idle0.png"),
-        north_run: load_run(0),
-        east_idle: asset_server.load("Characters/Male/Male_1_Idle0.png"),
-        east_run: load_run(1),
-        south_idle: asset_server.load("Characters/Male/Male_3_Idle0.png"),
-        south_run: load_run(3),
+        idle: std::array::from_fn(|d| {
+            asset_server.load(format!("Characters/Male/Male_{d}_Idle0.png"))
+        }),
+        run: std::array::from_fn(|d| {
+            std::array::from_fn(|i| {
+                asset_server.load(format!("Characters/Male/Male_{d}_Run{i}.png"))
+            })
+        }),
     };
-    let initial_idle = sprites.south_idle.clone();
+    let initial_idle = sprites.idle[FacingDir::South as usize].clone();
 
     let (cx, cy) = map.rooms[0].center();
     let pos = MapPosition::new(cx, cy);
@@ -195,6 +202,22 @@ fn spawn_player(
         });
 }
 
+// ── Direction helper ──────────────────────────────────────────────────────────
+
+fn dir_to_facing(dx: i32, dy: i32) -> FacingDir {
+    match (dx.signum(), dy.signum()) {
+        (0, -1)  => FacingDir::North,
+        (1, -1)  => FacingDir::NorthEast,
+        (1, 0)   => FacingDir::East,
+        (1, 1)   => FacingDir::SouthEast,
+        (0, 1)   => FacingDir::South,
+        (-1, 1)  => FacingDir::SouthWest,
+        (-1, 0)  => FacingDir::West,
+        (-1, -1) => FacingDir::NorthWest,
+        _        => FacingDir::South,
+    }
+}
+
 // ── Update system: keyboard movement ─────────────────────────────────────────
 
 fn player_movement(
@@ -226,12 +249,7 @@ fn player_movement(
     // Any keyboard movement cancels auto-travel.
     anim.path.clear();
 
-    let facing = match (dx, dy) {
-        (1, _)  => FacingDir::East,
-        (-1, _) => FacingDir::West,
-        (_, 1)  => FacingDir::South,
-        _       => FacingDir::North,
-    };
+    let facing = dir_to_facing(dx, dy);
 
     let new_x = pos.x + dx;
     let new_y = pos.y + dy;
@@ -322,12 +340,7 @@ fn auto_step(
         return;
     }
 
-    let facing = match (nx - pos.x, ny - pos.y) {
-        (1, _)  => FacingDir::East,
-        (-1, _) => FacingDir::West,
-        (_, 1)  => FacingDir::South,
-        _       => FacingDir::North,
-    };
+    let facing = dir_to_facing(nx - pos.x, ny - pos.y);
 
     pos.x = nx;
     pos.y = ny;
@@ -341,9 +354,11 @@ fn auto_step(
 
 fn animate_player(
     time: Res<Time>,
+    mut moving: ResMut<PlayerMoving>,
     mut query: Query<(&mut Sprite, &mut PlayerAnimation, &PlayerSprites), With<Player>>,
 ) {
     let Ok((mut sprite, mut anim, sprites)) = query.get_single_mut() else {
+        moving.0 = false;
         return;
     };
 
@@ -355,22 +370,18 @@ fn animate_player(
         }
     }
 
-    sprite.flip_x = anim.facing == FacingDir::West;
+    moving.0 = anim.running;
 
-    let (idle, run) = match anim.facing {
-        FacingDir::North => (&sprites.north_idle, &sprites.north_run),
-        FacingDir::East | FacingDir::West => (&sprites.east_idle, &sprites.east_run),
-        FacingDir::South => (&sprites.south_idle, &sprites.south_run),
-    };
+    let dir = anim.facing as usize;
 
     if anim.running {
         anim.frame_timer.tick(time.delta());
         if anim.frame_timer.just_finished() {
             anim.frame = (anim.frame + 1) % RUN_FRAME_COUNT;
         }
-        sprite.image = run[anim.frame].clone();
+        sprite.image = sprites.run[dir][anim.frame].clone();
     } else {
-        sprite.image = idle.clone();
+        sprite.image = sprites.idle[dir].clone();
     }
 }
 
@@ -380,7 +391,8 @@ pub struct PlayerPlugin;
 
 impl Plugin for PlayerPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<ClickState>()
+        app.init_resource::<PlayerMoving>()
+            .init_resource::<ClickState>()
             .add_systems(Startup, spawn_player)
             .add_systems(
                 Update,
@@ -426,6 +438,22 @@ mod tests {
         let (cx, cy) = map.rooms[0].center();
         let path = bfs_path(&map, (cx, cy), (cx, cy)).unwrap();
         assert!(path.is_empty());
+    }
+
+    #[test]
+    fn dir_to_facing_cardinals() {
+        assert_eq!(dir_to_facing(0, -1) as usize, FacingDir::North as usize);
+        assert_eq!(dir_to_facing(1, 0)  as usize, FacingDir::East  as usize);
+        assert_eq!(dir_to_facing(0, 1)  as usize, FacingDir::South as usize);
+        assert_eq!(dir_to_facing(-1, 0) as usize, FacingDir::West  as usize);
+    }
+
+    #[test]
+    fn dir_to_facing_diagonals() {
+        assert_eq!(dir_to_facing(1, -1)  as usize, FacingDir::NorthEast as usize);
+        assert_eq!(dir_to_facing(1, 1)   as usize, FacingDir::SouthEast as usize);
+        assert_eq!(dir_to_facing(-1, 1)  as usize, FacingDir::SouthWest as usize);
+        assert_eq!(dir_to_facing(-1, -1) as usize, FacingDir::NorthWest as usize);
     }
 
     #[test]

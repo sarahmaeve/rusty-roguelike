@@ -1,5 +1,6 @@
 mod camera;
 mod components;
+mod hud;
 mod map;
 mod player;
 
@@ -8,6 +9,7 @@ use bevy_light_2d::prelude::*;
 use components::YSort;
 
 use camera::CameraPlugin;
+use hud::HudPlugin;
 use map::MapPlugin;
 use player::PlayerPlugin;
 
@@ -45,7 +47,7 @@ fn main() {
                 })
                 .set(ImagePlugin::default_nearest()),
         )
-        .add_plugins((Light2dPlugin, MapPlugin, PlayerPlugin, CameraPlugin))
+        .add_plugins((Light2dPlugin, MapPlugin, PlayerPlugin, CameraPlugin, HudPlugin))
         .add_systems(Update, y_sort)
         .run();
 }
