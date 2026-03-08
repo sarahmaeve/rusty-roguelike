@@ -19,6 +19,11 @@ pub struct YSort;
 #[derive(Component)]
 pub struct WallTile;
 
+/// Marks any map tile (floor or wall) so the lighting-cull system can hide
+/// tiles that fall outside the player's current light envelope.
+#[derive(Component)]
+pub struct MapTile;
+
 /// Discrete tile-grid position for any entity on the map.
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MapPosition {

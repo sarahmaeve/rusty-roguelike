@@ -2,7 +2,7 @@ use bevy::{prelude::*, sprite::Anchor};
 use rand::Rng;
 
 use crate::{
-    components::{MapPosition, Player, WallTile, YSort},
+    components::{MapPosition, MapTile, Player, WallTile, YSort},
     ISO_STEP_X, ISO_STEP_Y, MAP_HEIGHT, MAP_WIDTH, TILE_SCALE,
 };
 
@@ -196,6 +196,7 @@ fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<Asse
                 TileType::Floor => {
                     let variant = rng.gen_range(0..floor_variants.len());
                     commands.spawn((
+                        MapTile,
                         Sprite {
                             image: floor_variants[variant].clone(),
                             anchor: floor_anchor,
@@ -226,6 +227,7 @@ fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<Asse
 
 
                     commands.spawn((
+                        MapTile,
                         YSort,
                         WallTile,
                         Sprite {

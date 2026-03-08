@@ -4,7 +4,7 @@ use bevy::{prelude::*, sprite::Anchor, window::PrimaryWindow};
 use bevy_light_2d::prelude::*;
 
 use crate::{
-    components::{MainCamera, MapPosition, Player, YSort},
+    components::{MainCamera, MapPosition, MapTile, Player, YSort},
     map::Map,
     ISO_STEP_X, ISO_STEP_Y, TILE_SCALE,
 };
@@ -55,14 +55,14 @@ const DOUBLE_CLICK_SECS: f32 = 0.3;
 /// Sprite brightness multiplier for `LightType::Dark` (0.4 = 40 %).
 const DARK_SPRITE_INTENSITY: f32 = 0.5;
 
-const LANTERN_RADIUS: f32 = 60.0;
-const LANTERN_INTENSITY: f32 = 2.5;
+const LANTERN_RADIUS: f32 = 120.0;
+const LANTERN_INTENSITY: f32 = 2.25;
 /// Beam starts at 20 % less intensity than the lantern base.
-const BEAM_BASE_FACTOR: f32 = 0.80;
-/// Each additional segment reduces beam intensity by a further 10 %.
-const BEAM_DECAY: f32 = 0.70;
+const BEAM_BASE_FACTOR: f32 = 0.75;
+/// Each additional segment reduces beam intensity by a further 40 %.
+const BEAM_DECAY: f32 = 0.60;
 /// Number of PointLight2d entities used to approximate the directional beam.
-const BEAM_SEGMENTS: usize = 8;
+const BEAM_SEGMENTS: usize = 6;
 /// World-space distance between consecutive beam-light centers.
 const BEAM_SEGMENT_SPACING: f32 = 60.0;
 /// Radius of each beam-segment PointLight2d — exceeds half the spacing so
@@ -653,6 +653,60 @@ fn apply_light_type(
     }
 }
 
+// ── Update system: hide map tiles outside the player's light envelope ─────────
+
+/// Hides every `MapTile` that falls outside the player's current light
+/// envelope so unlit areas are not rendered at all.
+///
+/// The envelope is the union of two regions:
+///
+/// - **Base circle** — centred on the player:
+///   - *Torch*: current flickering `PointLight2d` radius plus `TORCH_RADIUS_VAR`
+///     as a margin, preventing tiles from popping in and out at the flame's
+///     dancing edge.
+///   - *Lantern*: the fixed base radius.
+///   - *Dark*: 0 — every tile is hidden.
+///
+/// - **Beam circles** (lantern only) — one circle per active beam-segment
+///   entity (those with `intensity > 0`), using each segment's own world
+///   position and `PointLight2d` radius.  This correctly restricts visibility
+///   to the beam direction rather than a full ring.
+fn cull_map_tiles(
+    player_q: Query<(&Transform, &PointLight2d, &LightType), With<Player>>,
+    beam_q: Query<(&Transform, &PointLight2d), With<LanternBeamLight>>,
+    mut tile_q: Query<(&Transform, &mut Visibility), With<MapTile>>,
+) {
+    let Ok((player_tf, player_light, light_type)) = player_q.get_single() else {
+        return;
+    };
+    let player_pos = player_tf.translation.truncate();
+
+    let base_radius = match *light_type {
+        LightType::Dark => 0.0,
+        LightType::Torch => player_light.radius + TORCH_RADIUS_VAR,
+        LightType::Lantern => player_light.radius,
+    };
+
+    // Collect active beam-segment circles (position + radius).
+    let beams: Vec<(Vec2, f32)> = beam_q
+        .iter()
+        .filter(|(_, l)| l.intensity > 0.0)
+        .map(|(tf, l)| (tf.translation.truncate(), l.radius))
+        .collect();
+
+    for (tile_tf, mut vis) in tile_q.iter_mut() {
+        let tile_pos = tile_tf.translation.truncate();
+        let in_base = (tile_pos - player_pos).length() <= base_radius;
+        let in_beam = beams.iter().any(|&(bp, br)| (tile_pos - bp).length() <= br);
+
+        *vis = if in_base || in_beam {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+    }
+}
+
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
 pub struct PlayerPlugin;
@@ -672,6 +726,7 @@ impl Plugin for PlayerPlugin {
                     toggle_light_type,
                     flicker_torch.after(toggle_light_type),
                     apply_light_type.after(toggle_light_type),
+                    cull_map_tiles.after(apply_light_type),
                 ),
             );
     }
@@ -830,5 +885,47 @@ mod tests {
         // Try to reach a position that is guaranteed to be a wall with no floor
         // neighbours; (0,0) is always wall in our generator.
         assert!(bfs_path(&map, (cx, cy), (0, 0)).is_none());
+    }
+
+    // ── cull_map_tiles radius logic ───────────────────────────────────────────
+
+    /// Mirrors the base-radius formula in `cull_map_tiles` so changes in that
+    /// function must also update this test.
+    fn cull_base_radius(light_type: LightType, light_radius: f32) -> f32 {
+        match light_type {
+            LightType::Dark => 0.0,
+            LightType::Torch => light_radius + TORCH_RADIUS_VAR,
+            LightType::Lantern => light_radius,
+        }
+    }
+
+    #[test]
+    fn dark_mode_base_radius_is_zero() {
+        assert_eq!(cull_base_radius(LightType::Dark, TORCH_RADIUS), 0.0);
+    }
+
+    #[test]
+    fn torch_mode_base_radius_adds_flicker_margin() {
+        let radius = cull_base_radius(LightType::Torch, TORCH_RADIUS);
+        assert_eq!(radius, TORCH_RADIUS + TORCH_RADIUS_VAR);
+    }
+
+    #[test]
+    fn torch_cull_radius_covers_max_flicker() {
+        // The max flickered radius is TORCH_RADIUS + TORCH_RADIUS_VAR.
+        // The cull radius (with margin) must be >= that, so no tile can pop
+        // out at peak flicker.
+        let max_flicker_radius = TORCH_RADIUS + TORCH_RADIUS_VAR;
+        let cull = cull_base_radius(LightType::Torch, TORCH_RADIUS);
+        assert!(
+            cull >= max_flicker_radius,
+            "cull radius {cull} must cover max flicker radius {max_flicker_radius}"
+        );
+    }
+
+    #[test]
+    fn lantern_base_radius_equals_light_radius() {
+        let radius = cull_base_radius(LightType::Lantern, LANTERN_RADIUS);
+        assert_eq!(radius, LANTERN_RADIUS);
     }
 }
