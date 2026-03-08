@@ -9,13 +9,67 @@ use crate::{
     ISO_STEP_X, ISO_STEP_Y, TILE_SCALE,
 };
 
+// ── Beam wall-occlusion raycast ───────────────────────────────────────────────
+
+/// Step the ray `origin + dir * t` in 8-unit increments until it enters a wall
+/// tile or `max_dist` is reached.  Returns the last clear distance (≤ max_dist).
+///
+/// The step (8 world units) is well below the minimum tile crossing distance
+/// (~71 units for the isometric grid), so no wall tile can be skipped.
+fn wall_cast(map: &Map, origin: Vec2, dir: Vec2, max_dist: f32) -> f32 {
+    const STEP: f32 = 8.0;
+    let mut dist = STEP;
+    while dist <= max_dist {
+        let p = origin + dir * dist;
+        let diff = p.x / ISO_STEP_X;
+        let sum  = -p.y / ISO_STEP_Y;
+        let tx = ((diff + sum) / 2.0).round() as i32;
+        let ty = ((sum  - diff) / 2.0).round() as i32;
+        if !map.is_walkable(tx, ty) {
+            return dist - STEP;
+        }
+        dist += STEP;
+    }
+    max_dist
+}
+
 const RUN_FRAME_COUNT: usize = 10;
 /// Seconds per run animation frame (≈10 fps).
 const RUN_FRAME_SECS: f32 = 0.1;
+
+// ── Torch-flicker tunables ────────────────────────────────────────────────────
+
+const TORCH_RADIUS: f32 = 350.0;
+/// Peak excursion of the radius (the "edge" flicker).
+const TORCH_RADIUS_VAR: f32 = 60.0;
+const TORCH_INTENSITY: f32 = 3.5;
+/// Peak excursion of the intensity (the "core" flicker, kept subtle).
+const TORCH_INTENSITY_VAR: f32 = 0.25;
 /// Seconds between each auto-travel step (mouse double-click).
 const AUTO_STEP_SECS: f32 = 0.15;
 /// Two clicks within this window count as a double-click.
 const DOUBLE_CLICK_SECS: f32 = 0.3;
+
+// ── Lantern tunables ──────────────────────────────────────────────────────────
+
+/// Sprite brightness multiplier for `LightType::Dark` (0.4 = 40 %).
+const DARK_SPRITE_INTENSITY: f32 = 0.4;
+
+const LANTERN_RADIUS: f32 = 120.0;
+const LANTERN_INTENSITY: f32 = 3.5;
+/// Beam starts at 20 % less intensity than the lantern base.
+const BEAM_BASE_FACTOR: f32 = 0.80;
+/// Each additional segment reduces beam intensity by a further 10 %.
+const BEAM_DECAY: f32 = 0.90;
+/// Number of PointLight2d entities used to approximate the directional beam.
+const BEAM_SEGMENTS: usize = 8;
+/// World-space distance between consecutive beam-light centers.
+const BEAM_SEGMENT_SPACING: f32 = 60.0;
+/// Radius of each beam-segment PointLight2d — exceeds half the spacing so
+/// adjacent segments overlap, producing a continuous cone rather than spheres.
+const BEAM_LIGHT_RADIUS: f32 = 80.0;
+/// Maximum range of the directional beam (world units).
+const BEAM_MAX_DIST: f32 = BEAM_SEGMENT_SPACING * BEAM_SEGMENTS as f32;
 
 // ── Facing direction ──────────────────────────────────────────────────────────
 
@@ -30,7 +84,7 @@ const DOUBLE_CLICK_SECS: f32 = 0.3;
 ///   5 = SouthWest (dy=+1, dx=-1)
 ///   6 = West (dx=-1, dy=0)
 ///   7 = NorthWest (dy=-1, dx=-1)
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 enum FacingDir {
     North,
     NorthEast,
@@ -90,6 +144,51 @@ impl PlayerAnimation {
         self.running = true;
         self.run_cooldown.reset();
     }
+}
+
+// ── Torch-flicker component ───────────────────────────────────────────────────
+
+/// Drives the per-frame torch-light flicker on the player entity.
+/// `t` accumulates elapsed seconds and feeds layered sine oscillators.
+#[derive(Component, Default)]
+struct TorchFlicker {
+    t: f32,
+}
+
+// ── Light type ────────────────────────────────────────────────────────────────
+
+/// Selects the lighting behaviour attached to the player.
+#[derive(Component, Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LightType {
+    /// Flickering torch — large omnidirectional radius.
+    #[default]
+    Torch,
+    /// Steady lantern — small omnidirectional radius plus a directional beam.
+    Lantern,
+    /// Near-darkness — no world light; the player sprite is tinted to 40 %.
+    Dark,
+}
+
+impl LightType {
+    /// Advance to the next mode in the cycle: Torch → Lantern → Dark → Torch.
+    fn next(self) -> Self {
+        match self {
+            Self::Torch   => Self::Lantern,
+            Self::Lantern => Self::Dark,
+            Self::Dark    => Self::Torch,
+        }
+    }
+}
+
+// ── Lantern beam-light component ──────────────────────────────────────────────
+
+/// Marks one of the free-standing entities used to fake the lantern's
+/// directional beam.  Spawned as top-level entities (not player children) to
+/// avoid complications with the player's parent scale.
+#[derive(Component)]
+struct LanternBeamLight {
+    /// Index into `BEAM_SEGMENT_CENTERS` (0 = closest to player).
+    segment: usize,
 }
 
 // ── Public resources ──────────────────────────────────────────────────────────
@@ -177,6 +276,8 @@ fn spawn_player(
             pos,
             sprites,
             PlayerAnimation::new(),
+            TorchFlicker::default(),
+            LightType::default(),
             Sprite {
                 image: initial_idle,
                 // Ground-contact point (feet) at 20% from the bottom of the
@@ -187,10 +288,10 @@ fn spawn_player(
             },
             Transform::from_xyz(world.x, world.y, 0.0).with_scale(Vec3::splat(TILE_SCALE)),
             PointLight2d {
-                radius: 350.0,
-                intensity: 3.5,
+                radius: TORCH_RADIUS,
+                intensity: TORCH_INTENSITY,
                 color: Color::srgb(1.0, 0.82, 0.45),
-                cast_shadows: false,
+                cast_shadows: true,
                 ..Default::default()
             },
         ))
@@ -204,6 +305,23 @@ fn spawn_player(
                 Transform::from_xyz(0.0, 0.0, -0.01),
             ));
         });
+
+    // Spawn free-standing beam-light entities for the lantern.
+    // Inactive (intensity = 0) while the player uses the Torch light type.
+    // `update_lantern` repositions and activates them each frame as needed.
+    for segment in 0..BEAM_SEGMENTS {
+        commands.spawn((
+            LanternBeamLight { segment },
+            PointLight2d {
+                radius: 0.0,
+                intensity: 0.0,
+                color: Color::srgb(1.0, 0.95, 0.7),
+                cast_shadows: false,
+                ..Default::default()
+            },
+            Transform::default(),
+        ));
+    }
 }
 
 // ── Direction helper ──────────────────────────────────────────────────────────
@@ -220,6 +338,28 @@ fn dir_to_facing(dx: i32, dy: i32) -> FacingDir {
         (-1, -1) => FacingDir::NorthWest,
         _        => FacingDir::South,
     }
+}
+
+/// Convert a `FacingDir` to a normalised world-space 2-D direction, using the
+/// same isometric projection as `MapPosition::to_world`:
+///   world_x = (dx - dy) * ISO_STEP_X
+///   world_y = -(dx + dy) * ISO_STEP_Y
+fn facing_to_world_dir(facing: FacingDir) -> Vec2 {
+    let (dx, dy): (f32, f32) = match facing {
+        FacingDir::North     => ( 0.0, -1.0),
+        FacingDir::NorthEast => ( 1.0, -1.0),
+        FacingDir::East      => ( 1.0,  0.0),
+        FacingDir::SouthEast => ( 1.0,  1.0),
+        FacingDir::South     => ( 0.0,  1.0),
+        FacingDir::SouthWest => (-1.0,  1.0),
+        FacingDir::West      => (-1.0,  0.0),
+        FacingDir::NorthWest => (-1.0, -1.0),
+    };
+    Vec2::new(
+        (dx - dy) * ISO_STEP_X,
+        -(dx + dy) * ISO_STEP_Y,
+    )
+    .normalize()
 }
 
 // ── Update system: keyboard movement ─────────────────────────────────────────
@@ -389,6 +529,128 @@ fn animate_player(
     }
 }
 
+// ── Update system: torch-light flicker ───────────────────────────────────────
+
+/// Modulates the player's `PointLight2d` each frame to simulate a torch.
+///
+/// Strategy: layer four sine oscillators at incommensurate frequencies so the
+/// combination never repeats and sounds organic.  Slower oscillators dominate
+/// the *intensity* signal (the bright core stays relatively steady) while
+/// faster oscillators dominate the *radius* signal (the lit edge dances a lot).
+fn flicker_torch(
+    time: Res<Time>,
+    mut query: Query<(&mut PointLight2d, &mut TorchFlicker, &LightType), With<Player>>,
+) {
+    let Ok((mut light, mut flicker, light_type)) = query.get_single_mut() else {
+        return;
+    };
+    if *light_type != LightType::Torch {
+        return;
+    }
+
+    flicker.t += time.delta_secs();
+    let t = flicker.t;
+
+    // Four oscillators at frequencies chosen to be mutually irrational so the
+    // waveform never becomes periodic at a human-perceptible timescale.
+    let s1 = (t * 1.7_f32).sin();   // slow sway
+    let s2 = (t * 4.3_f32).sin();   // medium flicker
+    let s3 = (t * 11.0_f32).sin();  // fast edge shimmer
+    let s4 = (t * 23.7_f32).sin();  // micro-flutter
+
+    // Core (intensity): weighted toward slow oscillators → subtle breathing.
+    let core = s1 * 0.50 + s2 * 0.35 + s3 * 0.15;
+    // Edge (radius): weighted toward fast oscillators → lively boundary dance.
+    let edge = s1 * 0.15 + s2 * 0.25 + s3 * 0.35 + s4 * 0.25;
+
+    light.intensity = (TORCH_INTENSITY + core * TORCH_INTENSITY_VAR).max(0.5);
+    light.radius    = (TORCH_RADIUS    + edge * TORCH_RADIUS_VAR   ).max(150.0);
+}
+
+// ── Update system: L key cycles light type ────────────────────────────────────
+
+fn toggle_light_type(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut query: Query<&mut LightType, With<Player>>,
+) {
+    if !keyboard.just_pressed(KeyCode::KeyL) {
+        return;
+    }
+    let Ok(mut light_type) = query.get_single_mut() else { return; };
+    *light_type = light_type.next();
+}
+
+// ── Update system: apply active light type each frame ─────────────────────────
+
+/// Applies the player's current `LightType` every frame:
+///
+/// - **Torch** — handled entirely by `flicker_torch`; sprite stays white.
+/// - **Lantern** — base sphere locked to radius/intensity constants; beam
+///   lights repositioned along the facing direction; sprite stays white.
+/// - **Dark** — world `PointLight2d` silenced; sprite tinted to 40 % so the
+///   player is barely visible without illuminating anything else.
+fn apply_light_type(
+    map: Res<Map>,
+    mut player_q: Query<
+        (&Transform, &PlayerAnimation, &LightType, &mut PointLight2d, &mut Sprite),
+        With<Player>,
+    >,
+    mut beam_q: Query<(&mut Transform, &mut PointLight2d, &LanternBeamLight), Without<Player>>,
+) {
+    let Ok((player_tf, anim, light_type, mut player_light, mut sprite)) =
+        player_q.get_single_mut()
+    else {
+        return;
+    };
+
+    match *light_type {
+        LightType::Torch => {
+            // flicker_torch drives the PointLight2d; just keep the sprite white.
+            sprite.color = Color::WHITE;
+        }
+        LightType::Lantern => {
+            player_light.radius = LANTERN_RADIUS;
+            player_light.intensity = LANTERN_INTENSITY;
+            sprite.color = Color::WHITE;
+        }
+        LightType::Dark => {
+            player_light.intensity = 0.0;
+            player_light.radius = 0.0;
+            sprite.color = Color::srgb(DARK_SPRITE_INTENSITY, DARK_SPRITE_INTENSITY, DARK_SPRITE_INTENSITY);
+        }
+    }
+
+    let player_pos = player_tf.translation.truncate();
+    let beam_dir = (*light_type == LightType::Lantern)
+        .then(|| facing_to_world_dir(anim.facing));
+
+    // How far the beam travels before hitting a wall (0 when not in lantern mode).
+    let clear_dist = match beam_dir {
+        Some(dir) => wall_cast(&map, player_pos, dir, BEAM_MAX_DIST),
+        None => 0.0,
+    };
+
+    for (mut beam_tf, mut beam_light, beam) in &mut beam_q {
+        match beam_dir {
+            Some(dir) => {
+                let dist = (beam.segment as f32 + 0.5) * BEAM_SEGMENT_SPACING;
+                if dist <= clear_dist {
+                    beam_tf.translation = (player_pos + dir * dist).extend(0.0);
+                    beam_light.intensity = LANTERN_INTENSITY
+                        * BEAM_BASE_FACTOR
+                        * BEAM_DECAY.powi(beam.segment as i32);
+                    beam_light.radius = BEAM_LIGHT_RADIUS;
+                } else {
+                    beam_light.intensity = 0.0;
+                }
+            }
+            None => {
+                beam_light.intensity = 0.0;
+            }
+        }
+    }
+}
+
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
 pub struct PlayerPlugin;
@@ -405,6 +667,9 @@ impl Plugin for PlayerPlugin {
                     handle_mouse_click,
                     auto_step.after(player_movement),
                     animate_player,
+                    toggle_light_type,
+                    flicker_torch.after(toggle_light_type),
+                    apply_light_type.after(toggle_light_type),
                 ),
             );
     }
@@ -458,6 +723,101 @@ mod tests {
         assert_eq!(dir_to_facing(1, 1)   as usize, FacingDir::SouthEast as usize);
         assert_eq!(dir_to_facing(-1, 1)  as usize, FacingDir::SouthWest as usize);
         assert_eq!(dir_to_facing(-1, -1) as usize, FacingDir::NorthWest as usize);
+    }
+
+    #[test]
+    fn facing_to_world_dir_is_normalised() {
+        let all = [
+            FacingDir::North,
+            FacingDir::NorthEast,
+            FacingDir::East,
+            FacingDir::SouthEast,
+            FacingDir::South,
+            FacingDir::SouthWest,
+            FacingDir::West,
+            FacingDir::NorthWest,
+        ];
+        for facing in all {
+            let d = facing_to_world_dir(facing);
+            assert!(
+                (d.length() - 1.0).abs() < 1e-5,
+                "{facing:?} direction length {} is not 1",
+                d.length()
+            );
+        }
+    }
+
+    #[test]
+    fn facing_to_world_dir_opposites_cancel() {
+        let pairs = [
+            (FacingDir::North, FacingDir::South),
+            (FacingDir::East, FacingDir::West),
+            (FacingDir::NorthEast, FacingDir::SouthWest),
+            (FacingDir::NorthWest, FacingDir::SouthEast),
+        ];
+        for (a, b) in pairs {
+            let sum = facing_to_world_dir(a) + facing_to_world_dir(b);
+            assert!(
+                sum.length() < 1e-5,
+                "{a:?} and {b:?} should point in opposite directions (sum length = {})",
+                sum.length()
+            );
+        }
+    }
+
+    #[test]
+    fn light_type_cycle_is_complete() {
+        // Every mode must eventually return to Torch after enough presses.
+        let start = LightType::Torch;
+        let next1 = start.next();
+        let next2 = next1.next();
+        let next3 = next2.next();
+        assert_eq!(next1, LightType::Lantern);
+        assert_eq!(next2, LightType::Dark);
+        assert_eq!(next3, LightType::Torch, "cycle must return to Torch");
+    }
+
+    #[test]
+    fn dark_sprite_intensity_in_range() {
+        assert!(
+            DARK_SPRITE_INTENSITY > 0.0 && DARK_SPRITE_INTENSITY <= 1.0,
+            "DARK_SPRITE_INTENSITY must be in (0, 1]"
+        );
+    }
+
+    #[test]
+    fn beam_segment_centers_within_max_dist() {
+        for seg in 0..BEAM_SEGMENTS {
+            let center = (seg as f32 + 0.5) * BEAM_SEGMENT_SPACING;
+            assert!(
+                center <= BEAM_MAX_DIST,
+                "beam segment {seg} center {center} exceeds BEAM_MAX_DIST {BEAM_MAX_DIST}"
+            );
+        }
+    }
+
+    #[test]
+    fn beam_segments_overlap() {
+        // Each segment's radius must exceed half the spacing so adjacent lights
+        // overlap, preventing dark bands between them.
+        assert!(
+            BEAM_LIGHT_RADIUS > BEAM_SEGMENT_SPACING / 2.0,
+            "BEAM_LIGHT_RADIUS {BEAM_LIGHT_RADIUS} must exceed half BEAM_SEGMENT_SPACING {}",
+            BEAM_SEGMENT_SPACING / 2.0,
+        );
+    }
+
+    #[test]
+    fn beam_intensity_declines_each_segment() {
+        let mut prev = f32::MAX;
+        for seg in 0..BEAM_SEGMENTS {
+            let intensity = LANTERN_INTENSITY * BEAM_BASE_FACTOR * BEAM_DECAY.powi(seg as i32);
+            assert!(
+                intensity < prev,
+                "segment {seg} intensity {intensity} should be less than previous {prev}"
+            );
+            prev = intensity;
+        }
     }
 
     #[test]

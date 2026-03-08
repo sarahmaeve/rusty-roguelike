@@ -224,6 +224,7 @@ fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<Asse
                     else if w                { wall_e.clone() }
                     else                     { continue; }; // interior void — skip
 
+
                     commands.spawn((
                         YSort,
                         WallTile,
@@ -236,7 +237,7 @@ fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<Asse
                             ..Default::default()
                         },
                         Transform::from_xyz(wx, wy, 0.0)
-                            .with_scale(Vec3::splat(TILE_SCALE)),
+                            .with_scale(Vec3::splat(TILE_SCALE))
                     ));
                 }
             }
