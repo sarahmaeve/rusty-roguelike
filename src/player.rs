@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use bevy::{prelude::*, window::PrimaryWindow};
+use bevy::{prelude::*, sprite::Anchor, window::PrimaryWindow};
 use bevy_light_2d::prelude::*;
 
 use crate::{
@@ -179,6 +179,10 @@ fn spawn_player(
             PlayerAnimation::new(),
             Sprite {
                 image: initial_idle,
+                // Ground-contact point (feet) at 20% from the bottom of the
+                // sprite image, matching the wall tile anchor convention so the
+                // character stands correctly on the isometric floor plane.
+                anchor: Anchor::Custom(Vec2::new(0.0, -0.30)),
                 ..Default::default()
             },
             Transform::from_xyz(world.x, world.y, 0.0).with_scale(Vec3::splat(TILE_SCALE)),
@@ -197,7 +201,7 @@ fn spawn_player(
                     custom_size: Some(Vec2::new(ISO_STEP_X * 0.6, ISO_STEP_Y * 0.3)),
                     ..Default::default()
                 },
-                Transform::from_xyz(0.0, -ISO_STEP_Y * 0.5, -0.01),
+                Transform::from_xyz(0.0, 0.0, -0.01),
             ));
         });
 }
