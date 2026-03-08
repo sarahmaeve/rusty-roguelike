@@ -1,8 +1,10 @@
+use std::collections::HashMap;
+
 use bevy::{prelude::*, sprite::Anchor};
 use rand::Rng;
 
 use crate::{
-    components::{MapPosition, MapTile, Player, PropTile, WallTile, YSort},
+    components::{CardinalDir, Door, MapPosition, MapTile, Player, PropTile, WallTile, YSort},
     ISO_STEP_X, ISO_STEP_Y, MAP_HEIGHT, MAP_WIDTH, TILE_SCALE,
 };
 
@@ -17,6 +19,9 @@ const MAX_ROOM_SIZE: i32 = 8;
 /// The base type of a map cell.  Determines rendering and tile-level walkability
 /// (see [`Map::is_walkable`]).  Gameplay-level passability also accounts for
 /// props — see [`Map::is_passable`].
+// Variants beyond Wall/Floor are defined for fixed room designs and are not
+// yet constructed by the procedural generator.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TileType {
     // ── Impassable walls ──────────────────────────────────────────────────────
@@ -116,6 +121,8 @@ impl TileType {
 /// An object placed on top of a floor tile.  Props block player movement
 /// (see [`Map::is_passable`]) but do not block the lantern beam.
 /// Each variant has four directional sprites (`_N`, `_E`, `_S`, `_W`).
+// Variants are defined for fixed room designs and not yet placed procedurally.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PropType {
     Barrel,
@@ -164,6 +171,29 @@ impl PropType {
     }
 }
 
+// ── Door placement descriptor ─────────────────────────────────────────────────
+
+/// Describes a door to be spawned at startup.  Stored in [`Map::doors`] so
+/// that `spawn_doors` can create the entities and populate [`DoorRegistry`].
+///
+/// The tile at `(x, y)` must already be `TileType::Floor` in [`Map::tiles`]
+/// (set by the generator) so that passability is correct when the door is open.
+pub struct DoorPlacement {
+    pub x: i32,
+    pub y: i32,
+    pub open: bool,
+    /// Sprite face direction — matches the asset suffix convention (`_N` etc.)
+    /// and is determined by which adjacent tile holds the room interior.
+    pub facing: CardinalDir,
+}
+
+// ── Door registry ─────────────────────────────────────────────────────────────
+
+/// Maps grid positions to their door entity.  Used by movement and
+/// pathfinding systems to check whether a door at a given cell is closed.
+#[derive(Resource, Default)]
+pub struct DoorRegistry(pub HashMap<(i32, i32), Entity>);
+
 // ── Axis-aligned rectangle (used for rooms) ───────────────────────────────────
 
 #[derive(Clone, Copy)]
@@ -207,6 +237,8 @@ pub struct Map {
     /// Optional prop in each cell; same indexing as `tiles`.
     /// Props sit on top of floor tiles and block player movement.
     pub props: Vec<Option<PropType>>,
+    /// Doors to be spawned at startup.  Each entry's tile is already `Floor`.
+    pub doors: Vec<DoorPlacement>,
     pub rooms: Vec<Rect>,
 }
 
@@ -218,6 +250,7 @@ impl Map {
             height: MAP_HEIGHT,
             tiles: vec![TileType::Wall; size],
             props: vec![None; size],
+            doors: Vec::new(),
             rooms: Vec::new(),
         }
     }
@@ -230,14 +263,15 @@ impl Map {
         x >= 0 && x < self.width && y >= 0 && y < self.height
     }
 
-    /// Tile-level walkability check — ignores props.
+    /// Tile-level walkability check — ignores props and door entities.
     /// Used by wall-face selection, lantern beam casting, and map generation.
     pub fn is_walkable(&self, x: i32, y: i32) -> bool {
         self.in_bounds(x, y) && self.tiles[self.idx(x, y)].is_walkable()
     }
 
     /// Gameplay passability — `false` if the tile is impassable *or* a prop
-    /// occupies the cell.  Used by player movement and BFS pathfinding.
+    /// occupies the cell.  Does **not** check door entities (closed doors are
+    /// handled separately in movement systems via [`DoorRegistry`]).
     pub fn is_passable(&self, x: i32, y: i32) -> bool {
         self.is_walkable(x, y) && self.props[self.idx(x, y)].is_none()
     }
@@ -310,7 +344,62 @@ pub fn generate_map() -> Map {
         map.rooms.push(new_room);
     }
 
+    place_test_door(&mut map);
+
     map
+}
+
+/// Places a closed door on the south wall of the first room and carves one
+/// floor tile outside it, guaranteeing the player can approach from both sides.
+///
+/// The door tile (`room.y2`, center x) is converted from Wall to Floor so that
+/// `Map::is_walkable` returns `true` when the door entity is open.  The door
+/// entity provides movement blocking when closed.
+fn place_test_door(map: &mut Map) {
+    let Some(room) = map.rooms.first().copied() else {
+        return;
+    };
+
+    let cx = (room.x1 + room.x2) / 2;
+    let door_y = room.y2; // south boundary wall row
+
+    if !map.in_bounds(cx, door_y) {
+        return;
+    }
+
+    // Determine facing from neighbors *before* modifying the tile, so the
+    // adjacency check reflects the original carved interior.
+    // Convention (matches spawn_map_tiles wall selection):
+    //   north neighbor is floor → facing S  (stoneWallDoorClosed_S)
+    //   south neighbor is floor → facing N
+    //   east  neighbor is floor → facing W
+    //   west  neighbor is floor → facing E
+    let facing = if map.is_walkable(cx, door_y - 1) {
+        CardinalDir::S
+    } else if map.is_walkable(cx, door_y + 1) {
+        CardinalDir::N
+    } else if map.is_walkable(cx + 1, door_y) {
+        CardinalDir::W
+    } else {
+        CardinalDir::E
+    };
+
+    // Convert the wall tile to floor so the door position is walkable when open.
+    let door_idx = map.idx(cx, door_y);
+    map.tiles[door_idx] = TileType::Floor;
+
+    // Carve one tile to the south so the player can reach the door from outside.
+    if map.in_bounds(cx, door_y + 1) {
+        let outside_idx = map.idx(cx, door_y + 1);
+        map.tiles[outside_idx] = TileType::Floor;
+    }
+
+    map.doors.push(DoorPlacement {
+        x: cx,
+        y: door_y,
+        open: false,
+        facing,
+    });
 }
 
 // ── Startup system: spawn isometric tile sprites ──────────────────────────────
@@ -391,8 +480,6 @@ fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<Asse
             }
 
             // ── Prop ──────────────────────────────────────────────────────────
-            // Spawned on top of the floor tile at the same grid cell.
-            // Props use YSort so they depth-order correctly with the player.
             if let Some(prop) = map.props[map.idx(x, y)] {
                 let dir = DIRS[rng.gen_range(0..4)];
                 let image = asset_server
@@ -406,6 +493,42 @@ fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<Asse
                 ));
             }
         }
+    }
+}
+
+// ── Startup system: spawn door entities ───────────────────────────────────────
+
+/// Spawns a `Door` entity for every [`DoorPlacement`] in the map and registers
+/// it in [`DoorRegistry`] so movement systems can look up doors by grid position.
+fn spawn_doors(
+    mut commands: Commands,
+    map: Res<Map>,
+    asset_server: Res<AssetServer>,
+    mut registry: ResMut<DoorRegistry>,
+) {
+    let anchor = Anchor::Custom(Vec2::new(0.0, -0.30));
+
+    for placement in &map.doors {
+        let wx = (placement.x as f32 - placement.y as f32) * ISO_STEP_X;
+        let wy = -(placement.x as f32 + placement.y as f32) * ISO_STEP_Y;
+
+        let state = if placement.open { "Open" } else { "Closed" };
+        let dir = placement.facing.as_str();
+        let image =
+            asset_server.load(format!("Isometric/stoneWallDoor{state}_{dir}.png"));
+
+        let entity = commands
+            .spawn((
+                MapTile,
+                WallTile, // fades when occluding the player (removed on open below)
+                Door { open: placement.open, facing: placement.facing },
+                YSort,
+                Sprite { image, anchor, ..Default::default() },
+                Transform::from_xyz(wx, wy, 0.0).with_scale(Vec3::splat(TILE_SCALE)),
+            ))
+            .id();
+
+        registry.0.insert((placement.x, placement.y), entity);
     }
 }
 
@@ -460,7 +583,8 @@ impl Plugin for MapPlugin {
     fn build(&self, app: &mut App) {
         let map = generate_map();
         app.insert_resource(map)
-            .add_systems(Startup, spawn_map_tiles)
+            .init_resource::<DoorRegistry>()
+            .add_systems(Startup, (spawn_map_tiles, spawn_doors).chain())
             .add_systems(Update, fade_occluding_walls);
     }
 }
@@ -488,7 +612,6 @@ mod tests {
     fn first_room_center_is_passable() {
         let map = generate_map();
         let (cx, cy) = map.rooms[0].center();
-        // Generated maps have no props, so passable == walkable.
         assert!(map.is_passable(cx, cy));
     }
 
@@ -507,6 +630,53 @@ mod tests {
     fn props_len_matches_tiles() {
         let map = generate_map();
         assert_eq!(map.tiles.len(), map.props.len());
+    }
+
+    // ── Test door ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_door_is_placed() {
+        let map = generate_map();
+        assert_eq!(map.doors.len(), 1, "exactly one test door should be placed");
+    }
+
+    #[test]
+    fn test_door_tile_is_floor() {
+        // The tile at the door position must be Floor so that is_walkable returns
+        // true when the door is open.
+        let map = generate_map();
+        let door = &map.doors[0];
+        assert!(
+            map.is_walkable(door.x, door.y),
+            "door tile ({},{}) must be walkable (Floor)",
+            door.x,
+            door.y
+        );
+    }
+
+    #[test]
+    fn test_door_starts_closed() {
+        let map = generate_map();
+        assert!(!map.doors[0].open, "test door should start closed");
+    }
+
+    #[test]
+    fn test_door_outside_tile_is_floor() {
+        // The tile immediately south of the door (outside the room) must be
+        // Floor so the player can approach from outside.
+        let map = generate_map();
+        let door = &map.doors[0];
+        let outside_y = door.y + 1;
+        assert!(
+            map.in_bounds(door.x, outside_y),
+            "tile south of door must be in bounds"
+        );
+        assert!(
+            map.is_walkable(door.x, outside_y),
+            "tile south of door ({},{}) must be walkable",
+            door.x,
+            outside_y
+        );
     }
 
     // ── TileType::is_walkable ─────────────────────────────────────────────────
@@ -563,7 +733,6 @@ mod tests {
             TileType::Stairs,
         ] {
             assert!(t.is_floor_like());
-            // Prefix must be non-empty and not contain a path separator.
             let p = t.floor_asset_prefix();
             assert!(!p.is_empty());
             assert!(!p.contains('/'));
@@ -588,8 +757,6 @@ mod tests {
 
     #[test]
     fn occluding_walls_are_impassable() {
-        // Every tile that occludes the player must also be impassable, so the
-        // player can never stand inside an occluding wall.
         for t in [
             TileType::Wall,
             TileType::DoorClosed,

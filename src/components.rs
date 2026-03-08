@@ -30,6 +30,38 @@ pub struct MapTile;
 #[derive(Component)]
 pub struct PropTile;
 
+/// Isometric wall-face direction, matching the asset naming convention
+/// (`_N`, `_E`, `_S`, `_W` suffixes).  The suffix indicates which face of the
+/// wall tile is visible to the player.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CardinalDir {
+    N,
+    E,
+    S,
+    W,
+}
+
+impl CardinalDir {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::N => "N",
+            Self::E => "E",
+            Self::S => "S",
+            Self::W => "W",
+        }
+    }
+}
+
+/// An interactive door entity.  The map tile at its grid position is always
+/// `TileType::Floor`; this entity provides the visual and movement blocking.
+/// Toggle with the E key when adjacent.
+#[derive(Component)]
+pub struct Door {
+    pub open: bool,
+    /// Which face of the door sprite is shown (matches asset suffix convention).
+    pub facing: CardinalDir,
+}
+
 /// Discrete tile-grid position for any entity on the map.
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MapPosition {

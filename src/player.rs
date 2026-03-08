@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 
-use bevy::{prelude::*, sprite::Anchor, window::PrimaryWindow};
+use bevy::{ecs::system::SystemParam, prelude::*, sprite::Anchor, window::PrimaryWindow};
 use bevy_light_2d::prelude::*;
 
 use crate::{
-    components::{MainCamera, MapPosition, MapTile, Player, YSort},
-    map::Map,
+    components::{Door, MainCamera, MapPosition, MapTile, Player, YSort},
+    map::{DoorRegistry, Map},
     ISO_STEP_X, ISO_STEP_Y, TILE_SCALE,
 };
-// Note: wall_cast uses Map::is_walkable (tile-level; props do not block beams).
-// Movement and pathfinding use Map::is_passable (tile + no prop).
+// wall_cast     → Map::is_walkable  (tile-level; props and doors do not block beams)
+// movement/BFS  → Map::is_passable + DoorRegistry  (tile + no prop + no closed door)
 
 // ── Beam wall-occlusion raycast ───────────────────────────────────────────────
 
@@ -211,8 +211,17 @@ struct ClickState {
 
 /// Returns a path from `start` (exclusive) to `goal` (inclusive) as a list of
 /// grid positions stored in *reverse* order so that `pop()` yields the next
-/// step. Returns `None` if no walkable path exists.
-fn bfs_path(map: &Map, start: (i32, i32), goal: (i32, i32)) -> Option<Vec<(i32, i32)>> {
+/// step. Returns `None` if no passable path exists.
+///
+/// `closed_doors` is the set of grid positions currently blocked by a closed
+/// door entity.  Closed door cells are passable at the tile level (their tile
+/// is `Floor`) but must be treated as blocked for pathfinding purposes.
+fn bfs_path(
+    map: &Map,
+    closed_doors: &std::collections::HashSet<(i32, i32)>,
+    start: (i32, i32),
+    goal: (i32, i32),
+) -> Option<Vec<(i32, i32)>> {
     if start == goal {
         return Some(Vec::new());
     }
@@ -238,7 +247,10 @@ fn bfs_path(map: &Map, start: (i32, i32), goal: (i32, i32)) -> Option<Vec<(i32, 
 
         for (dx, dy) in [(0_i32, 1_i32), (0, -1), (1, 0), (-1, 0)] {
             let next = (current.0 + dx, current.1 + dy);
-            if map.is_passable(next.0, next.1) && !came_from.contains_key(&next) {
+            if map.is_passable(next.0, next.1)
+                && !closed_doors.contains(&next)
+                && !came_from.contains_key(&next)
+            {
                 came_from.insert(next, current);
                 queue.push_back(next);
             }
@@ -246,6 +258,22 @@ fn bfs_path(map: &Map, start: (i32, i32), goal: (i32, i32)) -> Option<Vec<(i32, 
     }
 
     None
+}
+
+/// Builds the set of grid positions currently blocked by a closed door.
+/// Called before pathfinding and single-step movement checks.
+fn closed_door_positions(
+    registry: &DoorRegistry,
+    door_q: &Query<&Door>,
+) -> std::collections::HashSet<(i32, i32)> {
+    registry
+        .0
+        .iter()
+        .filter(|(_, entity)| {
+            door_q.get(**entity).map(|d| !d.open).unwrap_or(false)
+        })
+        .map(|(&pos, _)| pos)
+        .collect()
 }
 
 // ── Startup system: spawn the player ─────────────────────────────────────────
@@ -364,11 +392,55 @@ fn facing_to_world_dir(facing: FacingDir) -> Vec2 {
     .normalize()
 }
 
+// ── SystemParam bundles ───────────────────────────────────────────────────────
+
+/// Converts the cursor's screen position to isometric world-space.
+/// Bundles the window and camera queries needed for `viewport_to_world_2d`.
+#[derive(SystemParam)]
+struct WorldCursor<'w, 's> {
+    windows: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
+    camera: Query<'w, 's, (&'static Camera, &'static GlobalTransform), With<MainCamera>>,
+}
+
+impl WorldCursor<'_, '_> {
+    /// Returns the cursor's current world-space position, or `None` if the
+    /// cursor is outside the window or the camera query fails.
+    fn world_pos(&self) -> Option<Vec2> {
+        let window = self.windows.get_single().ok()?;
+        let (camera, camera_tf) = self.camera.get_single().ok()?;
+        let cursor = window.cursor_position()?;
+        camera.viewport_to_world_2d(camera_tf, cursor).ok()
+    }
+}
+
+/// Door registry + read-only door query, bundled for use in movement and
+/// click-handling systems that need to check closed-door positions.
+#[derive(SystemParam)]
+struct DoorParams<'w, 's> {
+    registry: Res<'w, DoorRegistry>,
+    doors: Query<'w, 's, &'static Door>,
+}
+
+impl DoorParams<'_, '_> {
+    fn closed_positions(&self) -> std::collections::HashSet<(i32, i32)> {
+        closed_door_positions(&self.registry, &self.doors)
+    }
+
+    fn is_closed_at(&self, pos: (i32, i32)) -> bool {
+        self.registry
+            .0
+            .get(&pos)
+            .and_then(|&e| self.doors.get(e).ok())
+            .is_some_and(|d| !d.open)
+    }
+}
+
 // ── Update system: keyboard movement ─────────────────────────────────────────
 
 fn player_movement(
     keyboard: Res<ButtonInput<KeyCode>>,
     map: Res<Map>,
+    doors: DoorParams<'_, '_>,
     mut query: Query<(&mut MapPosition, &mut Transform, &mut PlayerAnimation), With<Player>>,
 ) {
     let Ok((mut pos, mut transform, mut anim)) = query.get_single_mut() else {
@@ -400,7 +472,7 @@ fn player_movement(
     let new_x = pos.x + dx;
     let new_y = pos.y + dy;
 
-    if map.is_passable(new_x, new_y) {
+    if map.is_passable(new_x, new_y) && !doors.is_closed_at((new_x, new_y)) {
         pos.x = new_x;
         pos.y = new_y;
         let world = pos.to_world(0.0);
@@ -417,9 +489,9 @@ fn player_movement(
 fn handle_mouse_click(
     mouse: Res<ButtonInput<MouseButton>>,
     time: Res<Time>,
-    windows: Query<&Window, With<PrimaryWindow>>,
-    camera_q: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
+    cursor: WorldCursor<'_, '_>,
     map: Res<Map>,
+    doors: DoorParams<'_, '_>,
     mut click_state: ResMut<ClickState>,
     mut player_q: Query<(&MapPosition, &mut PlayerAnimation), With<Player>>,
 ) {
@@ -427,10 +499,7 @@ fn handle_mouse_click(
         return;
     }
 
-    let Ok(window) = windows.get_single() else { return; };
-    let Ok((camera, camera_tf)) = camera_q.get_single() else { return; };
-    let Some(cursor_pos) = window.cursor_position() else { return; };
-    let Ok(world_pos) = camera.viewport_to_world_2d(camera_tf, cursor_pos) else { return; };
+    let Some(world_pos) = cursor.world_pos() else { return; };
 
     let now = time.elapsed_secs();
     let is_double = (now - click_state.last_click_time) < DOUBLE_CLICK_SECS;
@@ -454,7 +523,8 @@ fn handle_mouse_click(
 
     let Ok((pos, mut anim)) = player_q.get_single_mut() else { return; };
 
-    if let Some(path) = bfs_path(&map, (pos.x, pos.y), (target_x, target_y)) {
+    let closed_doors = doors.closed_positions();
+    if let Some(path) = bfs_path(&map, &closed_doors, (pos.x, pos.y), (target_x, target_y)) {
         anim.path = path;
         anim.step_timer.reset();
     }
@@ -465,6 +535,7 @@ fn handle_mouse_click(
 fn auto_step(
     time: Res<Time>,
     map: Res<Map>,
+    doors: DoorParams<'_, '_>,
     mut query: Query<(&mut MapPosition, &mut Transform, &mut PlayerAnimation), With<Player>>,
 ) {
     let Ok((mut pos, mut transform, mut anim)) = query.get_single_mut() else { return; };
@@ -480,8 +551,8 @@ fn auto_step(
 
     let Some((nx, ny)) = anim.path.pop() else { return; };
 
-    // Re-validate in case the map changed (e.g. future dynamic obstacles).
-    if !map.is_passable(nx, ny) {
+    // Re-validate in case a door was closed along the auto-travel path.
+    if !map.is_passable(nx, ny) || doors.is_closed_at((nx, ny)) {
         anim.path.clear();
         return;
     }
@@ -655,6 +726,44 @@ fn apply_light_type(
     }
 }
 
+// ── Update system: interact with adjacent doors ───────────────────────────────
+
+/// Press **E** to toggle a door adjacent (4-directional) to the player.
+///
+/// - Swaps the sprite between `stoneWallDoorOpen_*` and `stoneWallDoorClosed_*`.
+/// - Flips `door.open`.
+/// - Only one door is toggled per keypress (the first match in NESW order).
+fn interact_with_doors(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    player_q: Query<&MapPosition, With<Player>>,
+    door_registry: Res<DoorRegistry>,
+    mut door_q: Query<(&mut Door, &mut Sprite)>,
+    asset_server: Res<AssetServer>,
+) {
+    if !keyboard.just_pressed(KeyCode::KeyE) {
+        return;
+    }
+    let Ok(pos) = player_q.get_single() else {
+        return;
+    };
+
+    for (dx, dy) in [(0_i32, 1_i32), (0, -1), (1, 0), (-1, 0)] {
+        let adj = (pos.x + dx, pos.y + dy);
+        let Some(&entity) = door_registry.0.get(&adj) else {
+            continue;
+        };
+        let Ok((mut door, mut sprite)) = door_q.get_mut(entity) else {
+            continue;
+        };
+
+        door.open = !door.open;
+        let state = if door.open { "Open" } else { "Closed" };
+        let dir = door.facing.as_str();
+        sprite.image = asset_server.load(format!("Isometric/stoneWallDoor{state}_{dir}.png"));
+        break; // one door per keypress
+    }
+}
+
 // ── Update system: hide map tiles outside the player's light envelope ─────────
 
 /// Hides every `MapTile` that falls outside the player's current light
@@ -725,6 +834,7 @@ impl Plugin for PlayerPlugin {
                     handle_mouse_click,
                     auto_step.after(player_movement),
                     animate_player,
+                    interact_with_doors,
                     toggle_light_type,
                     flicker_torch.after(toggle_light_type),
                     apply_light_type.after(toggle_light_type),
@@ -747,11 +857,12 @@ mod tests {
         let (ax, ay) = map.rooms[0].center();
         let (bx, by) = map.rooms.last().unwrap().center();
         // If there is only one room the path is empty (already there).
+        let no_doors = std::collections::HashSet::new();
         if (ax, ay) == (bx, by) {
-            assert!(bfs_path(&map, (ax, ay), (bx, by)).unwrap().is_empty());
+            assert!(bfs_path(&map, &no_doors, (ax, ay), (bx, by)).unwrap().is_empty());
             return;
         }
-        let path = bfs_path(&map, (ax, ay), (bx, by));
+        let path = bfs_path(&map, &no_doors, (ax, ay), (bx, by));
         assert!(path.is_some(), "rooms should be connected via corridors");
         let path = path.unwrap();
         // Last element popped is the first step — must be adjacent to start.
@@ -764,7 +875,7 @@ mod tests {
     fn bfs_same_start_and_goal() {
         let map = generate_map();
         let (cx, cy) = map.rooms[0].center();
-        let path = bfs_path(&map, (cx, cy), (cx, cy)).unwrap();
+        let path = bfs_path(&map, &Default::default(), (cx, cy), (cx, cy)).unwrap();
         assert!(path.is_empty());
     }
 
@@ -880,13 +991,37 @@ mod tests {
     }
 
     #[test]
+    fn bfs_closed_door_blocks_path() {
+        let map = generate_map();
+        let door = &map.doors[0];
+        let door_pos = (door.x, door.y);
+        let (cx, cy) = map.rooms[0].center();
+
+        // The door tile is Floor, so BFS can reach it with an empty closed set.
+        let no_doors: std::collections::HashSet<(i32, i32)> = Default::default();
+        assert!(
+            bfs_path(&map, &no_doors, (cx, cy), door_pos).is_some(),
+            "BFS should reach the door tile when it is not in the closed set"
+        );
+
+        // When the door position is in the closed set, BFS must not reach it —
+        // closed-door positions are never pushed onto the queue, so they cannot
+        // be popped as the goal either.
+        let closed = std::collections::HashSet::from([door_pos]);
+        assert!(
+            bfs_path(&map, &closed, (cx, cy), door_pos).is_none(),
+            "BFS must not reach a tile listed in the closed-door set"
+        );
+    }
+
+    #[test]
     fn bfs_unreachable_returns_none() {
         let map = generate_map();
         // (0,0) is a wall tile and is surrounded by walls — completely isolated.
         let (cx, cy) = map.rooms[0].center();
         // Try to reach a position that is guaranteed to be a wall with no floor
         // neighbours; (0,0) is always wall in our generator.
-        assert!(bfs_path(&map, (cx, cy), (0, 0)).is_none());
+        assert!(bfs_path(&map, &Default::default(), (cx, cy), (0, 0)).is_none());
     }
 
     // ── cull_map_tiles radius logic ───────────────────────────────────────────
