@@ -8,6 +8,8 @@ use crate::{
     map::Map,
     ISO_STEP_X, ISO_STEP_Y, TILE_SCALE,
 };
+// Note: wall_cast uses Map::is_walkable (tile-level; props do not block beams).
+// Movement and pathfinding use Map::is_passable (tile + no prop).
 
 // ── Beam wall-occlusion raycast ───────────────────────────────────────────────
 
@@ -236,7 +238,7 @@ fn bfs_path(map: &Map, start: (i32, i32), goal: (i32, i32)) -> Option<Vec<(i32, 
 
         for (dx, dy) in [(0_i32, 1_i32), (0, -1), (1, 0), (-1, 0)] {
             let next = (current.0 + dx, current.1 + dy);
-            if map.is_walkable(next.0, next.1) && !came_from.contains_key(&next) {
+            if map.is_passable(next.0, next.1) && !came_from.contains_key(&next) {
                 came_from.insert(next, current);
                 queue.push_back(next);
             }
@@ -398,7 +400,7 @@ fn player_movement(
     let new_x = pos.x + dx;
     let new_y = pos.y + dy;
 
-    if map.is_walkable(new_x, new_y) {
+    if map.is_passable(new_x, new_y) {
         pos.x = new_x;
         pos.y = new_y;
         let world = pos.to_world(0.0);
@@ -446,7 +448,7 @@ fn handle_mouse_click(
     let target_x = ((diff + sum) / 2.0).round() as i32;
     let target_y = ((sum  - diff) / 2.0).round() as i32;
 
-    if !map.is_walkable(target_x, target_y) {
+    if !map.is_passable(target_x, target_y) {
         return;
     }
 
@@ -479,7 +481,7 @@ fn auto_step(
     let Some((nx, ny)) = anim.path.pop() else { return; };
 
     // Re-validate in case the map changed (e.g. future dynamic obstacles).
-    if !map.is_walkable(nx, ny) {
+    if !map.is_passable(nx, ny) {
         anim.path.clear();
         return;
     }

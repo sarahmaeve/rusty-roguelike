@@ -24,6 +24,12 @@ pub struct WallTile;
 #[derive(Component)]
 pub struct MapTile;
 
+/// Marks a prop entity (barrel, chest, crate, etc.) placed on top of a floor
+/// tile.  Props use `YSort` for depth ordering and block player movement via
+/// [`Map::is_passable`], but do not block the lantern beam.
+#[derive(Component)]
+pub struct PropTile;
+
 /// Discrete tile-grid position for any entity on the map.
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MapPosition {
