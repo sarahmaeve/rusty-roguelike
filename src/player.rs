@@ -4,7 +4,7 @@ use bevy::{ecs::system::SystemParam, prelude::*, sprite::Anchor, window::Primary
 use bevy_light_2d::prelude::*;
 
 use crate::{
-    components::{Door, MainCamera, MapPosition, MapTile, Player, StairsUpTile, YSort},
+    components::{Door, MainCamera, MapPosition, MapTile, Player, StairsMidTile, StairsUpTile, YSort},
     map::{spawn_floor_doors, spawn_floor_tiles, DoorRegistry, Dungeon, Map, TileType},
     ISO_STEP_X, ISO_STEP_Y, TILE_SCALE,
 };
@@ -473,6 +473,13 @@ fn player_movement(
     let new_y = pos.y + dy;
 
     let map = dungeon.current_map();
+
+    // On a StairsMid tile, W/S (dy ≠ 0) navigate the shaft rather than
+    // moving on the floor — let interact_with_stairs consume those presses.
+    if dy != 0 && map.tiles[map.idx(pos.x, pos.y)] == TileType::StairsMid {
+        return;
+    }
+
     if map.is_passable(new_x, new_y) && !doors.is_closed_at((new_x, new_y)) {
         pos.x = new_x;
         pos.y = new_y;
@@ -752,10 +759,9 @@ fn interact_with_doors(
         return;
     };
 
-    // Stairs take priority — let interact_with_stairs handle this keypress.
+    // Any stair tile takes priority — let interact_with_stairs handle it.
     let map = dungeon.current_map();
-    let tile = map.tiles[map.idx(pos.x, pos.y)];
-    if tile == TileType::StairsDown || tile == TileType::StairsUp {
+    if map.tiles[map.idx(pos.x, pos.y)].is_stair() {
         return;
     }
 
@@ -788,25 +794,39 @@ pub struct LevelTransition {
 
 // ── Update system: interact with stair tiles ──────────────────────────────────
 
-/// Press **E** while standing on a `StairsDown` or `StairsUp` tile to travel
-/// to the linked floor.  Fires a [`LevelTransition`] event; the actual floor
-/// swap is handled by [`execute_level_transition`].
+/// Handles stair traversal for all three stair tile types:
+///
+/// - **`StairsDown`** — press **E** to descend.
+/// - **`StairsUp`**   — press **E** to ascend.
+/// - **`StairsMid`**  — press **W / ↑** to ascend, **S / ↓** to descend.
+///   (Vertical movement keys are blocked in `player_movement` when on this tile.)
+///
+/// Fires a [`LevelTransition`] event consumed by [`execute_level_transition`].
 fn interact_with_stairs(
     keyboard: Res<ButtonInput<KeyCode>>,
     player_q: Query<&MapPosition, With<Player>>,
     dungeon: Res<Dungeon>,
     mut events: EventWriter<LevelTransition>,
 ) {
-    if !keyboard.just_pressed(KeyCode::KeyE) {
-        return;
-    }
     let Ok(pos) = player_q.get_single() else { return; };
     let map = dungeon.current_map();
     let tile = map.tiles[map.idx(pos.x, pos.y)];
-    if tile != TileType::StairsDown && tile != TileType::StairsUp {
-        return;
-    }
-    if let Some(link) = map.stair_links.get(&(pos.x, pos.y)) {
+    let Some(node) = map.stair_links.get(&(pos.x, pos.y)) else { return; };
+
+    let link = match tile {
+        TileType::StairsDown if keyboard.just_pressed(KeyCode::KeyE) => node.down.as_ref(),
+        TileType::StairsUp   if keyboard.just_pressed(KeyCode::KeyE) => node.up.as_ref(),
+        TileType::StairsMid => {
+            let up   = keyboard.just_pressed(KeyCode::KeyW) || keyboard.just_pressed(KeyCode::ArrowUp);
+            let down = keyboard.just_pressed(KeyCode::KeyS) || keyboard.just_pressed(KeyCode::ArrowDown);
+            if up        { node.up.as_ref()   }
+            else if down { node.down.as_ref() }
+            else         { None }
+        }
+        _ => None,
+    };
+
+    if let Some(link) = link {
         events.send(LevelTransition {
             destination_floor: link.target_floor,
             exit_pos: link.target_pos,
@@ -883,7 +903,10 @@ fn execute_level_transition(
 fn cull_map_tiles(
     player_q: Query<(&Transform, &PointLight2d, &LightType), With<Player>>,
     beam_q: Query<(&Transform, &PointLight2d), With<LanternBeamLight>>,
-    mut tile_q: Query<(&Transform, &mut Visibility, Option<&StairsUpTile>), With<MapTile>>,
+    mut tile_q: Query<
+        (&Transform, &mut Visibility, Option<&StairsUpTile>, Option<&StairsMidTile>),
+        With<MapTile>,
+    >,
 ) {
     let Ok((player_tf, player_light, light_type)) = player_q.get_single() else {
         return;
@@ -903,10 +926,10 @@ fn cull_map_tiles(
         .map(|(tf, l)| (tf.translation.truncate(), l.radius))
         .collect();
 
-    for (tile_tf, mut vis, stairs_up) in tile_q.iter_mut() {
-        // StairsUp tiles originate on the floor above; the shaft opening
-        // provides ambient illumination so they are always fully visible.
-        if stairs_up.is_some() {
+    for (tile_tf, mut vis, stairs_up, stairs_mid) in tile_q.iter_mut() {
+        // StairsUp and StairsMid tiles both have their shaft open from above;
+        // ambient light from the opening keeps them always visible.
+        if stairs_up.is_some() || stairs_mid.is_some() {
             *vis = Visibility::Inherited;
             continue;
         }

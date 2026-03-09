@@ -4,7 +4,7 @@ use bevy::{prelude::*, sprite::Anchor};
 use rand::Rng;
 
 use crate::{
-    components::{CardinalDir, Door, MapPosition, MapTile, Player, PropTile, StairsUpTile, WallTile, YSort},
+    components::{CardinalDir, Door, MapPosition, MapTile, Player, PropTile, StairsMidTile, StairsUpTile, WallTile, YSort},
     ISO_STEP_X, ISO_STEP_Y, MAP_HEIGHT, MAP_WIDTH, TILE_SCALE,
 };
 
@@ -47,6 +47,9 @@ pub enum TileType {
     /// Spiral staircase descending to the next (deeper) floor.
     /// Press **E** while standing on it to descend.
     StairsDown,
+    /// Intermediate stair tile connecting the floor above and the floor below.
+    /// Press **W / ↑** to ascend or **S / ↓** to descend while standing on it.
+    StairsMid,
     /// Staircase ascending to the previous (shallower) floor.
     /// Press **E** while standing on it to ascend.
     StairsUp,
@@ -70,6 +73,7 @@ impl TileType {
                 | Self::Planks
                 | Self::Bridge
                 | Self::StairsDown
+                | Self::StairsMid
                 | Self::StairsUp
                 | Self::DoorOpen
                 | Self::Archway
@@ -85,6 +89,7 @@ impl TileType {
                 | Self::Planks
                 | Self::Bridge
                 | Self::StairsDown
+                | Self::StairsMid
                 | Self::StairsUp
         )
     }
@@ -97,7 +102,7 @@ impl TileType {
             Self::Dirt => "dirt",
             Self::Planks => "planks",
             Self::Bridge => "bridge",
-            Self::StairsDown | Self::StairsUp => "stairsSpiral",
+            Self::StairsDown | Self::StairsMid | Self::StairsUp => "stairsSpiral",
             _ => panic!("floor_asset_prefix called on non-floor TileType"),
         }
     }
@@ -124,6 +129,12 @@ impl TileType {
             self,
             Self::Wall | Self::DoorClosed | Self::BrokenWall | Self::Window
         )
+    }
+
+    /// Returns `true` for any stair tile variant.  Used to give stair
+    /// interaction priority over door interaction on the **E** key.
+    pub fn is_stair(self) -> bool {
+        matches!(self, Self::StairsDown | Self::StairsMid | Self::StairsUp)
     }
 }
 
@@ -184,10 +195,21 @@ impl PropType {
 
 // ── Stair link ────────────────────────────────────────────────────────────────
 
-/// Connects a stair tile at a grid position to its landing point on another floor.
+/// One directional leg of a staircase — the floor and tile position the player
+/// lands on after travelling in that direction.
 pub struct StairLink {
     pub target_floor: usize,
     pub target_pos: (i32, i32),
+}
+
+/// The full traversal options for a single stair tile.
+///
+/// - `StairsDown` tiles have `down = Some(…)` and `up = None`.
+/// - `StairsUp`   tiles have `up   = Some(…)` and `down = None`.
+/// - `StairsMid`  tiles have both `Some(…)`.
+pub struct StairNode {
+    pub up:   Option<StairLink>,
+    pub down: Option<StairLink>,
 }
 
 // ── Door placement descriptor ─────────────────────────────────────────────────
@@ -259,8 +281,8 @@ pub struct Map {
     /// Doors to be spawned at startup.  Each entry's tile is already `Floor`.
     pub doors: Vec<DoorPlacement>,
     pub rooms: Vec<Rect>,
-    /// Maps stair tile positions on this floor to their exit on another floor.
-    pub stair_links: HashMap<(i32, i32), StairLink>,
+    /// Maps stair tile positions on this floor to their traversal options.
+    pub stair_links: HashMap<(i32, i32), StairNode>,
 }
 
 impl Map {
@@ -388,36 +410,50 @@ pub fn generate_map() -> Map {
     map
 }
 
-/// Generates a multi-floor dungeon with stairs connecting adjacent floors.
+/// Generates a multi-floor dungeon linked by a single staircase shaft.
 ///
-/// `StairsDown` is placed at the last room of each floor (the "exit"); the
-/// corresponding `StairsUp` lands at the first room of the next floor.
-/// Press **E** while standing on either stair tile to traverse it.
+/// Each floor's stair tile sits at its last room's centre, forming a chain:
+///
+/// ```text
+/// floor 0  StairsDown  ──down──▶  floor 1  StairsMid  ──down──▶  floor 2  StairsUp
+///                                            ◀──up──                  ◀──up──
+/// ```
+///
+/// - **`StairsDown`** (top floor): press **E** to descend.
+/// - **`StairsMid`** (intermediate): press **W / ↑** to ascend, **S / ↓** to descend.
+/// - **`StairsUp`** (bottom floor): press **E** to ascend.
 pub fn generate_dungeon(num_floors: usize) -> Dungeon {
     assert!(num_floors >= 1, "dungeon must have at least one floor");
 
     let mut floors: Vec<Map> = (0..num_floors).map(|_| generate_map()).collect();
 
-    for f in 0..num_floors.saturating_sub(1) {
-        // StairsDown at the last (furthest) room of floor f.
-        let &last_room = floors[f].rooms.last().expect("floor must have at least one room");
-        let (dx, dy) = last_room.center();
-        let di = floors[f].idx(dx, dy);
-        floors[f].tiles[di] = TileType::StairsDown;
+    // Collect each floor's stair position (last room centre) up front so we
+    // can reference adjacent floors while building links.
+    let positions: Vec<(i32, i32)> = floors
+        .iter()
+        .map(|m| m.rooms.last().expect("floor must have at least one room").center())
+        .collect();
 
-        // StairsUp at the first room of floor f+1 (arrival point).
-        let first_room = floors[f + 1].rooms[0];
-        let (ux, uy) = first_room.center();
-        let ui = floors[f + 1].idx(ux, uy);
-        floors[f + 1].tiles[ui] = TileType::StairsUp;
+    for f in 0..num_floors {
+        let (sx, sy) = positions[f];
+        let si = floors[f].idx(sx, sy);
+
+        let is_top    = f == 0;
+        let is_bottom = f == num_floors - 1;
+
+        floors[f].tiles[si] = match (is_top, is_bottom) {
+            (true,  true)  => continue,           // single-floor: no stairs
+            (true,  false) => TileType::StairsDown,
+            (false, true)  => TileType::StairsUp,
+            (false, false) => TileType::StairsMid,
+        };
 
         floors[f].stair_links.insert(
-            (dx, dy),
-            StairLink { target_floor: f + 1, target_pos: (ux, uy) },
-        );
-        floors[f + 1].stair_links.insert(
-            (ux, uy),
-            StairLink { target_floor: f, target_pos: (dx, dy) },
+            (sx, sy),
+            StairNode {
+                up:   (!is_top   ).then(|| StairLink { target_floor: f - 1, target_pos: positions[f - 1] }),
+                down: (!is_bottom).then(|| StairLink { target_floor: f + 1, target_pos: positions[f + 1] }),
+            },
         );
     }
 
@@ -499,10 +535,12 @@ pub fn spawn_floor_tiles(commands: &mut Commands, map: &Map, asset_server: &Asse
                     Sprite { image, anchor, ..Default::default() },
                     Transform::from_xyz(wx, wy, floor_z).with_scale(Vec3::splat(TILE_SCALE)),
                 ));
-                // StairsUp tiles are always visible — the opening above provides
-                // ambient light regardless of the player's torch radius.
-                if tile == TileType::StairsUp {
-                    entity.insert(StairsUpTile);
+                // Stair tiles whose shaft opens from above are always visible —
+                // the opening provides ambient light regardless of torch radius.
+                match tile {
+                    TileType::StairsUp  => { entity.insert(StairsUpTile); }
+                    TileType::StairsMid => { entity.insert(StairsMidTile); }
+                    _ => {}
                 }
             } else {
                 // ── Wall-like ─────────────────────────────────────────────────
@@ -769,27 +807,52 @@ mod tests {
     fn stairs_down_placed_on_all_but_last_floor() {
         let dungeon = generate_dungeon(3);
         for f in 0..2 {
-            let has_stairs_down = dungeon.floors[f]
+            let has_down = dungeon.floors[f]
                 .stair_links
                 .values()
-                .any(|link| link.target_floor == f + 1);
-            assert!(has_stairs_down, "floor {f} must have a StairsDown link to floor {}", f + 1);
+                .any(|node| node.down.is_some());
+            assert!(has_down, "floor {f} must have a downward stair link");
+        }
+        // The last floor must NOT have a downward link.
+        assert!(
+            dungeon.floors[2].stair_links.values().all(|node| node.down.is_none()),
+            "last floor must not have a downward link"
+        );
+    }
+
+    #[test]
+    fn intermediate_floor_has_stairsmid() {
+        let dungeon = generate_dungeon(3);
+        let has_mid = dungeon.floors[1].stair_links.keys().any(|&(x, y)| {
+            dungeon.floors[1].tiles[dungeon.floors[1].idx(x, y)] == TileType::StairsMid
+        });
+        assert!(has_mid, "floor 1 of 3 must contain a StairsMid tile");
+    }
+
+    #[test]
+    fn stairsmid_has_both_links() {
+        let dungeon = generate_dungeon(3);
+        for (&(x, y), node) in &dungeon.floors[1].stair_links {
+            if dungeon.floors[1].tiles[dungeon.floors[1].idx(x, y)] == TileType::StairsMid {
+                assert!(node.up.is_some(),   "StairsMid at ({x},{y}) must have an up link");
+                assert!(node.down.is_some(), "StairsMid at ({x},{y}) must have a down link");
+            }
         }
     }
 
     #[test]
     fn stairs_links_are_bidirectional() {
         let dungeon = generate_dungeon(3);
-        for f in 0..2 {
-            for (&pos, link) in &dungeon.floors[f].stair_links {
-                if link.target_floor == f + 1 {
-                    // The target floor must have a link back to f at the landing position.
-                    let back = dungeon.floors[f + 1]
+        for f in 0..dungeon.floors.len() {
+            for (&pos, node) in &dungeon.floors[f].stair_links {
+                if let Some(down) = &node.down {
+                    let back = dungeon.floors[down.target_floor]
                         .stair_links
-                        .get(&link.target_pos)
-                        .expect("target floor must have a return stair link");
-                    assert_eq!(back.target_floor, f);
-                    assert_eq!(back.target_pos, pos);
+                        .get(&down.target_pos)
+                        .expect("target floor must have a return stair node");
+                    let up = back.up.as_ref().expect("return node must have an up link");
+                    assert_eq!(up.target_floor, f);
+                    assert_eq!(up.target_pos, pos);
                 }
             }
         }
@@ -797,22 +860,12 @@ mod tests {
 
     #[test]
     fn stair_tiles_are_walkable() {
-        let dungeon = generate_dungeon(2);
-        // StairsDown on floor 0
-        for (&(x, y), link) in &dungeon.floors[0].stair_links {
-            if link.target_floor == 1 {
+        let dungeon = generate_dungeon(3);
+        for (f, floor) in dungeon.floors.iter().enumerate() {
+            for &(x, y) in floor.stair_links.keys() {
                 assert!(
-                    dungeon.floors[0].is_walkable(x, y),
-                    "StairsDown at ({x},{y}) must be walkable"
-                );
-            }
-        }
-        // StairsUp on floor 1
-        for (&(x, y), link) in &dungeon.floors[1].stair_links {
-            if link.target_floor == 0 {
-                assert!(
-                    dungeon.floors[1].is_walkable(x, y),
-                    "StairsUp at ({x},{y}) must be walkable"
+                    floor.is_walkable(x, y),
+                    "stair tile at ({x},{y}) on floor {f} must be walkable"
                 );
             }
         }
@@ -834,6 +887,7 @@ mod tests {
             TileType::Planks,
             TileType::Bridge,
             TileType::StairsDown,
+            TileType::StairsMid,
             TileType::StairsUp,
             TileType::DoorOpen,
             TileType::Archway,
@@ -877,6 +931,7 @@ mod tests {
             TileType::Planks,
             TileType::Bridge,
             TileType::StairsDown,
+            TileType::StairsMid,
             TileType::StairsUp,
         ] {
             assert!(t.is_floor_like());

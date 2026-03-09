@@ -37,6 +37,12 @@ pub struct PropTile;
 #[derive(Component)]
 pub struct StairsUpTile;
 
+/// Marks an intermediate stair tile (`StairsMid`) that sits between two floors.
+/// Like `StairsUpTile`, the shaft opening above keeps it always visible.
+/// Press **W / ↑** to ascend or **S / ↓** to descend while standing on it.
+#[derive(Component)]
+pub struct StairsMidTile;
+
 /// Isometric wall-face direction, matching the asset naming convention
 /// (`_N`, `_E`, `_S`, `_W` suffixes).  The suffix indicates which face of the
 /// wall tile is visible to the player.
