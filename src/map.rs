@@ -4,7 +4,7 @@ use bevy::{prelude::*, sprite::Anchor};
 use rand::Rng;
 
 use crate::{
-    components::{CardinalDir, Door, MapPosition, MapTile, Player, PropTile, WallTile, YSort},
+    components::{CardinalDir, Door, MapPosition, MapTile, Player, PropTile, StairsUpTile, WallTile, YSort},
     ISO_STEP_X, ISO_STEP_Y, MAP_HEIGHT, MAP_WIDTH, TILE_SCALE,
 };
 
@@ -97,8 +97,7 @@ impl TileType {
             Self::Dirt => "dirt",
             Self::Planks => "planks",
             Self::Bridge => "bridge",
-            Self::StairsDown => "stairsSpiral",
-            Self::StairsUp => "stairs",
+            Self::StairsDown | Self::StairsUp => "stairsSpiral",
             _ => panic!("floor_asset_prefix called on non-floor TileType"),
         }
     }
@@ -495,11 +494,16 @@ pub fn spawn_floor_tiles(commands: &mut Commands, map: &Map, asset_server: &Asse
                 let dir = DIRS[rng.gen_range(0..4)];
                 let image = asset_server
                     .load(format!("Isometric/{}_{dir}.png", tile.floor_asset_prefix()));
-                commands.spawn((
+                let mut entity = commands.spawn((
                     MapTile,
                     Sprite { image, anchor, ..Default::default() },
                     Transform::from_xyz(wx, wy, floor_z).with_scale(Vec3::splat(TILE_SCALE)),
                 ));
+                // StairsUp tiles are always visible — the opening above provides
+                // ambient light regardless of the player's torch radius.
+                if tile == TileType::StairsUp {
+                    entity.insert(StairsUpTile);
+                }
             } else {
                 // ── Wall-like ─────────────────────────────────────────────────
                 let s = map.is_walkable(x, y + 1);

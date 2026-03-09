@@ -30,6 +30,13 @@ pub struct MapTile;
 #[derive(Component)]
 pub struct PropTile;
 
+/// Marks a tile entity whose staircase originates on a different (shallower)
+/// floor — i.e. a `StairsUp` tile.  These tiles are always fully visible
+/// regardless of the player's current light radius, because the opening
+/// above them provides its own ambient illumination.
+#[derive(Component)]
+pub struct StairsUpTile;
+
 /// Isometric wall-face direction, matching the asset naming convention
 /// (`_N`, `_E`, `_S`, `_W` suffixes).  The suffix indicates which face of the
 /// wall tile is visible to the player.

@@ -4,7 +4,7 @@ use bevy::{ecs::system::SystemParam, prelude::*, sprite::Anchor, window::Primary
 use bevy_light_2d::prelude::*;
 
 use crate::{
-    components::{Door, MainCamera, MapPosition, MapTile, Player, YSort},
+    components::{Door, MainCamera, MapPosition, MapTile, Player, StairsUpTile, YSort},
     map::{spawn_floor_doors, spawn_floor_tiles, DoorRegistry, Dungeon, Map, TileType},
     ISO_STEP_X, ISO_STEP_Y, TILE_SCALE,
 };
@@ -883,7 +883,7 @@ fn execute_level_transition(
 fn cull_map_tiles(
     player_q: Query<(&Transform, &PointLight2d, &LightType), With<Player>>,
     beam_q: Query<(&Transform, &PointLight2d), With<LanternBeamLight>>,
-    mut tile_q: Query<(&Transform, &mut Visibility), With<MapTile>>,
+    mut tile_q: Query<(&Transform, &mut Visibility, Option<&StairsUpTile>), With<MapTile>>,
 ) {
     let Ok((player_tf, player_light, light_type)) = player_q.get_single() else {
         return;
@@ -903,7 +903,14 @@ fn cull_map_tiles(
         .map(|(tf, l)| (tf.translation.truncate(), l.radius))
         .collect();
 
-    for (tile_tf, mut vis) in tile_q.iter_mut() {
+    for (tile_tf, mut vis, stairs_up) in tile_q.iter_mut() {
+        // StairsUp tiles originate on the floor above; the shaft opening
+        // provides ambient illumination so they are always fully visible.
+        if stairs_up.is_some() {
+            *vis = Visibility::Inherited;
+            continue;
+        }
+
         let tile_pos = tile_tf.translation.truncate();
         let in_base = (tile_pos - player_pos).length() <= base_radius;
         let in_beam = beams.iter().any(|&(bp, br)| (tile_pos - bp).length() <= br);
