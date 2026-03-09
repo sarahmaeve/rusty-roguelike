@@ -5,7 +5,7 @@ use bevy_light_2d::prelude::*;
 
 use crate::{
     components::{Door, MainCamera, MapPosition, MapTile, Player, YSort},
-    map::{DoorRegistry, Map},
+    map::{spawn_floor_doors, spawn_floor_tiles, DoorRegistry, Dungeon, Map, TileType},
     ISO_STEP_X, ISO_STEP_Y, TILE_SCALE,
 };
 // wall_cast     → Map::is_walkable  (tile-level; props and doors do not block beams)
@@ -280,7 +280,7 @@ fn closed_door_positions(
 
 fn spawn_player(
     mut commands: Commands,
-    map: Res<Map>,
+    dungeon: Res<Dungeon>,
     asset_server: Res<AssetServer>,
 ) {
     let sprites = PlayerSprites {
@@ -295,7 +295,7 @@ fn spawn_player(
     };
     let initial_idle = sprites.idle[FacingDir::South as usize].clone();
 
-    let (cx, cy) = map.rooms[0].center();
+    let (cx, cy) = dungeon.current_map().rooms[0].center();
     let pos = MapPosition::new(cx, cy);
     let world = pos.to_world(0.0);
 
@@ -439,7 +439,7 @@ impl DoorParams<'_, '_> {
 
 fn player_movement(
     keyboard: Res<ButtonInput<KeyCode>>,
-    map: Res<Map>,
+    dungeon: Res<Dungeon>,
     doors: DoorParams<'_, '_>,
     mut query: Query<(&mut MapPosition, &mut Transform, &mut PlayerAnimation), With<Player>>,
 ) {
@@ -472,6 +472,7 @@ fn player_movement(
     let new_x = pos.x + dx;
     let new_y = pos.y + dy;
 
+    let map = dungeon.current_map();
     if map.is_passable(new_x, new_y) && !doors.is_closed_at((new_x, new_y)) {
         pos.x = new_x;
         pos.y = new_y;
@@ -490,7 +491,7 @@ fn handle_mouse_click(
     mouse: Res<ButtonInput<MouseButton>>,
     time: Res<Time>,
     cursor: WorldCursor<'_, '_>,
-    map: Res<Map>,
+    dungeon: Res<Dungeon>,
     doors: DoorParams<'_, '_>,
     mut click_state: ResMut<ClickState>,
     mut player_q: Query<(&MapPosition, &mut PlayerAnimation), With<Player>>,
@@ -517,6 +518,7 @@ fn handle_mouse_click(
     let target_x = ((diff + sum) / 2.0).round() as i32;
     let target_y = ((sum  - diff) / 2.0).round() as i32;
 
+    let map = dungeon.current_map();
     if !map.is_passable(target_x, target_y) {
         return;
     }
@@ -524,7 +526,7 @@ fn handle_mouse_click(
     let Ok((pos, mut anim)) = player_q.get_single_mut() else { return; };
 
     let closed_doors = doors.closed_positions();
-    if let Some(path) = bfs_path(&map, &closed_doors, (pos.x, pos.y), (target_x, target_y)) {
+    if let Some(path) = bfs_path(map, &closed_doors, (pos.x, pos.y), (target_x, target_y)) {
         anim.path = path;
         anim.step_timer.reset();
     }
@@ -534,7 +536,7 @@ fn handle_mouse_click(
 
 fn auto_step(
     time: Res<Time>,
-    map: Res<Map>,
+    dungeon: Res<Dungeon>,
     doors: DoorParams<'_, '_>,
     mut query: Query<(&mut MapPosition, &mut Transform, &mut PlayerAnimation), With<Player>>,
 ) {
@@ -552,6 +554,7 @@ fn auto_step(
     let Some((nx, ny)) = anim.path.pop() else { return; };
 
     // Re-validate in case a door was closed along the auto-travel path.
+    let map = dungeon.current_map();
     if !map.is_passable(nx, ny) || doors.is_closed_at((nx, ny)) {
         anim.path.clear();
         return;
@@ -663,7 +666,7 @@ fn toggle_light_type(
 /// - **Dark** — world `PointLight2d` silenced; sprite tinted to 40 % so the
 ///   player is barely visible without illuminating anything else.
 fn apply_light_type(
-    map: Res<Map>,
+    dungeon: Res<Dungeon>,
     mut player_q: Query<
         (&Transform, &PlayerAnimation, &LightType, &mut PointLight2d, &mut Sprite),
         With<Player>,
@@ -701,7 +704,7 @@ fn apply_light_type(
 
     // How far the beam travels before hitting a wall (0 when not in lantern mode).
     let clear_dist = match beam_dir {
-        Some(dir) => wall_cast(&map, player_pos, dir, BEAM_MAX_DIST),
+        Some(dir) => wall_cast(dungeon.current_map(), player_pos, dir, BEAM_MAX_DIST),
         None => 0.0,
     };
 
@@ -733,9 +736,11 @@ fn apply_light_type(
 /// - Swaps the sprite between `stoneWallDoorOpen_*` and `stoneWallDoorClosed_*`.
 /// - Flips `door.open`.
 /// - Only one door is toggled per keypress (the first match in NESW order).
+/// - Does nothing when the player is standing on a stair tile (stairs take priority).
 fn interact_with_doors(
     keyboard: Res<ButtonInput<KeyCode>>,
     player_q: Query<&MapPosition, With<Player>>,
+    dungeon: Res<Dungeon>,
     door_registry: Res<DoorRegistry>,
     mut door_q: Query<(&mut Door, &mut Sprite)>,
     asset_server: Res<AssetServer>,
@@ -746,6 +751,13 @@ fn interact_with_doors(
     let Ok(pos) = player_q.get_single() else {
         return;
     };
+
+    // Stairs take priority — let interact_with_stairs handle this keypress.
+    let map = dungeon.current_map();
+    let tile = map.tiles[map.idx(pos.x, pos.y)];
+    if tile == TileType::StairsDown || tile == TileType::StairsUp {
+        return;
+    }
 
     for (dx, dy) in [(0_i32, 1_i32), (0, -1), (1, 0), (-1, 0)] {
         let adj = (pos.x + dx, pos.y + dy);
@@ -761,6 +773,92 @@ fn interact_with_doors(
         let dir = door.facing.as_str();
         sprite.image = asset_server.load(format!("Isometric/stoneWallDoor{state}_{dir}.png"));
         break; // one door per keypress
+    }
+}
+
+// ── Event: level transition ───────────────────────────────────────────────────
+
+/// Fired when the player uses a stair tile.  Consumed by
+/// [`execute_level_transition`] in the same frame to swap the active floor.
+#[derive(Event, Clone, Copy)]
+pub struct LevelTransition {
+    pub destination_floor: usize,
+    pub exit_pos: (i32, i32),
+}
+
+// ── Update system: interact with stair tiles ──────────────────────────────────
+
+/// Press **E** while standing on a `StairsDown` or `StairsUp` tile to travel
+/// to the linked floor.  Fires a [`LevelTransition`] event; the actual floor
+/// swap is handled by [`execute_level_transition`].
+fn interact_with_stairs(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    player_q: Query<&MapPosition, With<Player>>,
+    dungeon: Res<Dungeon>,
+    mut events: EventWriter<LevelTransition>,
+) {
+    if !keyboard.just_pressed(KeyCode::KeyE) {
+        return;
+    }
+    let Ok(pos) = player_q.get_single() else { return; };
+    let map = dungeon.current_map();
+    let tile = map.tiles[map.idx(pos.x, pos.y)];
+    if tile != TileType::StairsDown && tile != TileType::StairsUp {
+        return;
+    }
+    if let Some(link) = map.stair_links.get(&(pos.x, pos.y)) {
+        events.send(LevelTransition {
+            destination_floor: link.target_floor,
+            exit_pos: link.target_pos,
+        });
+    }
+}
+
+// ── Update system: execute a level transition ─────────────────────────────────
+
+/// Consumes a [`LevelTransition`] event: despawns all current floor tiles and
+/// door entities, switches `Dungeon::current_floor`, spawns the new floor's
+/// tiles and doors, and teleports the player to the exit stair position.
+fn execute_level_transition(
+    mut commands: Commands,
+    mut dungeon: ResMut<Dungeon>,
+    mut events: EventReader<LevelTransition>,
+    tiles_q: Query<Entity, With<MapTile>>,
+    mut registry: ResMut<DoorRegistry>,
+    asset_server: Res<AssetServer>,
+    mut player_q: Query<(&mut MapPosition, &mut Transform, &mut PlayerAnimation), With<Player>>,
+) {
+    // Only handle the first event per frame; discard any extras.
+    let Some(ev) = events.read().next() else { return; };
+    let destination_floor = ev.destination_floor;
+    let exit_pos = ev.exit_pos;
+
+    // Despawn all current floor entities (tiles, walls, doors).
+    for entity in &tiles_q {
+        commands.entity(entity).despawn();
+    }
+    registry.0.clear();
+
+    // Activate the new floor.
+    dungeon.current_floor = destination_floor;
+
+    // Spawn new floor geometry and doors.
+    spawn_floor_tiles(&mut commands, &dungeon.floors[destination_floor], &asset_server);
+    spawn_floor_doors(
+        &mut commands,
+        &dungeon.floors[destination_floor],
+        &asset_server,
+        &mut registry,
+    );
+
+    // Teleport the player to the landing stair and cancel any auto-travel path.
+    if let Ok((mut pos, mut transform, mut anim)) = player_q.get_single_mut() {
+        anim.path.clear();
+        pos.x = exit_pos.0;
+        pos.y = exit_pos.1;
+        let world = pos.to_world(0.0);
+        transform.translation.x = world.x;
+        transform.translation.y = world.y;
     }
 }
 
@@ -826,6 +924,7 @@ impl Plugin for PlayerPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PlayerMoving>()
             .init_resource::<ClickState>()
+            .add_event::<LevelTransition>()
             .add_systems(Startup, spawn_player)
             .add_systems(
                 Update,
@@ -834,7 +933,9 @@ impl Plugin for PlayerPlugin {
                     handle_mouse_click,
                     auto_step.after(player_movement),
                     animate_player,
-                    interact_with_doors,
+                    interact_with_stairs,
+                    execute_level_transition.after(interact_with_stairs),
+                    interact_with_doors.after(interact_with_stairs),
                     toggle_light_type,
                     flicker_torch.after(toggle_light_type),
                     apply_light_type.after(toggle_light_type),

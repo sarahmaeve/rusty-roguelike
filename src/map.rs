@@ -13,6 +13,7 @@ use crate::{
 const MAX_ROOMS: usize = 12;
 const MIN_ROOM_SIZE: i32 = 3;
 const MAX_ROOM_SIZE: i32 = 8;
+const NUM_DUNGEON_FLOORS: usize = 3;
 
 // ── Tile type ─────────────────────────────────────────────────────────────────
 
@@ -43,8 +44,12 @@ pub enum TileType {
     Planks,
     /// Bridge section spanning a gap.
     Bridge,
-    /// Spiral staircase — level transition point.
-    Stairs,
+    /// Spiral staircase descending to the next (deeper) floor.
+    /// Press **E** while standing on it to descend.
+    StairsDown,
+    /// Staircase ascending to the previous (shallower) floor.
+    /// Press **E** while standing on it to ascend.
+    StairsUp,
 
     // ── Walkable wall openings ────────────────────────────────────────────────
     /// Open doorway — walkable; uses `stoneWallDoorOpen_*` sprites.
@@ -64,7 +69,8 @@ impl TileType {
                 | Self::Dirt
                 | Self::Planks
                 | Self::Bridge
-                | Self::Stairs
+                | Self::StairsDown
+                | Self::StairsUp
                 | Self::DoorOpen
                 | Self::Archway
         )
@@ -74,7 +80,12 @@ impl TileType {
     pub fn is_floor_like(self) -> bool {
         matches!(
             self,
-            Self::Floor | Self::Dirt | Self::Planks | Self::Bridge | Self::Stairs
+            Self::Floor
+                | Self::Dirt
+                | Self::Planks
+                | Self::Bridge
+                | Self::StairsDown
+                | Self::StairsUp
         )
     }
 
@@ -86,7 +97,8 @@ impl TileType {
             Self::Dirt => "dirt",
             Self::Planks => "planks",
             Self::Bridge => "bridge",
-            Self::Stairs => "stairsSpiral",
+            Self::StairsDown => "stairsSpiral",
+            Self::StairsUp => "stairs",
             _ => panic!("floor_asset_prefix called on non-floor TileType"),
         }
     }
@@ -171,10 +183,18 @@ impl PropType {
     }
 }
 
+// ── Stair link ────────────────────────────────────────────────────────────────
+
+/// Connects a stair tile at a grid position to its landing point on another floor.
+pub struct StairLink {
+    pub target_floor: usize,
+    pub target_pos: (i32, i32),
+}
+
 // ── Door placement descriptor ─────────────────────────────────────────────────
 
 /// Describes a door to be spawned at startup.  Stored in [`Map::doors`] so
-/// that `spawn_doors` can create the entities and populate [`DoorRegistry`].
+/// that `spawn_floor_doors` can create the entities and populate [`DoorRegistry`].
 ///
 /// The tile at `(x, y)` must already be `TileType::Floor` in [`Map::tiles`]
 /// (set by the generator) so that passability is correct when the door is open.
@@ -240,6 +260,8 @@ pub struct Map {
     /// Doors to be spawned at startup.  Each entry's tile is already `Floor`.
     pub doors: Vec<DoorPlacement>,
     pub rooms: Vec<Rect>,
+    /// Maps stair tile positions on this floor to their exit on another floor.
+    pub stair_links: HashMap<(i32, i32), StairLink>,
 }
 
 impl Map {
@@ -252,6 +274,7 @@ impl Map {
             props: vec![None; size],
             doors: Vec::new(),
             rooms: Vec::new(),
+            stair_links: HashMap::new(),
         }
     }
 
@@ -308,6 +331,23 @@ impl Map {
     }
 }
 
+// ── Dungeon resource ──────────────────────────────────────────────────────────
+
+/// Holds all floors of the dungeon and tracks which floor the player is on.
+/// Floor 0 is the shallowest; higher indices are deeper underground.
+#[derive(Resource)]
+pub struct Dungeon {
+    pub floors: Vec<Map>,
+    pub current_floor: usize,
+}
+
+impl Dungeon {
+    /// Returns a reference to the currently active floor map.
+    pub fn current_map(&self) -> &Map {
+        &self.floors[self.current_floor]
+    }
+}
+
 // ── Dungeon generator ─────────────────────────────────────────────────────────
 
 pub fn generate_map() -> Map {
@@ -349,6 +389,42 @@ pub fn generate_map() -> Map {
     map
 }
 
+/// Generates a multi-floor dungeon with stairs connecting adjacent floors.
+///
+/// `StairsDown` is placed at the last room of each floor (the "exit"); the
+/// corresponding `StairsUp` lands at the first room of the next floor.
+/// Press **E** while standing on either stair tile to traverse it.
+pub fn generate_dungeon(num_floors: usize) -> Dungeon {
+    assert!(num_floors >= 1, "dungeon must have at least one floor");
+
+    let mut floors: Vec<Map> = (0..num_floors).map(|_| generate_map()).collect();
+
+    for f in 0..num_floors.saturating_sub(1) {
+        // StairsDown at the last (furthest) room of floor f.
+        let &last_room = floors[f].rooms.last().expect("floor must have at least one room");
+        let (dx, dy) = last_room.center();
+        let di = floors[f].idx(dx, dy);
+        floors[f].tiles[di] = TileType::StairsDown;
+
+        // StairsUp at the first room of floor f+1 (arrival point).
+        let first_room = floors[f + 1].rooms[0];
+        let (ux, uy) = first_room.center();
+        let ui = floors[f + 1].idx(ux, uy);
+        floors[f + 1].tiles[ui] = TileType::StairsUp;
+
+        floors[f].stair_links.insert(
+            (dx, dy),
+            StairLink { target_floor: f + 1, target_pos: (ux, uy) },
+        );
+        floors[f + 1].stair_links.insert(
+            (ux, uy),
+            StairLink { target_floor: f, target_pos: (dx, dy) },
+        );
+    }
+
+    Dungeon { floors, current_floor: 0 }
+}
+
 /// Places a closed door on the south wall of the first room and carves one
 /// floor tile outside it, guaranteeing the player can approach from both sides.
 ///
@@ -369,11 +445,6 @@ fn place_test_door(map: &mut Map) {
 
     // Determine facing from neighbors *before* modifying the tile, so the
     // adjacency check reflects the original carved interior.
-    // Convention (matches spawn_map_tiles wall selection):
-    //   north neighbor is floor → facing S  (stoneWallDoorClosed_S)
-    //   south neighbor is floor → facing N
-    //   east  neighbor is floor → facing W
-    //   west  neighbor is floor → facing E
     let facing = if map.is_walkable(cx, door_y - 1) {
         CardinalDir::S
     } else if map.is_walkable(cx, door_y + 1) {
@@ -402,12 +473,12 @@ fn place_test_door(map: &mut Map) {
     });
 }
 
-// ── Startup system: spawn isometric tile sprites ──────────────────────────────
+// ── Tile/door spawning (pub: called from startup and level-transition) ─────────
 
-fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<AssetServer>) {
+/// Spawns isometric tile sprites for all cells in `map`.  Can be called from
+/// both startup and level-transition systems.
+pub fn spawn_floor_tiles(commands: &mut Commands, map: &Map, asset_server: &AssetServer) {
     const DIRS: [&str; 4] = ["N", "E", "S", "W"];
-    // Anchor places the sprite's isometric diamond center at the world position.
-    // In the ~256×320 tile images the diamond center sits ~30% below image center.
     let anchor = Anchor::Custom(Vec2::new(0.0, -0.30));
     let mut rng = rand::thread_rng();
 
@@ -415,9 +486,6 @@ fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<Asse
         for x in 0..map.width {
             let wx = (x as f32 - y as f32) * ISO_STEP_X;
             let wy = -(x as f32 + y as f32) * ISO_STEP_Y;
-            // Fixed depth for floor tiles: higher col+row → higher z → rendered
-            // in front of tiles farther from the viewer.  Offset well below
-            // YSort objects so floors never obscure entities.
             let floor_z = (x + y) as f32 * 0.001 - 200.0;
 
             let tile = map.tiles[map.idx(x, y)];
@@ -440,13 +508,6 @@ fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<Asse
                 let w = map.is_walkable(x - 1, y);
 
                 let image = if tile == TileType::Wall {
-                    // Standard walls use corner pieces where two runs meet.
-                    // Corner pieces cover two perpendicular faces, filling the
-                    // visual gap that forms at run intersections.
-                    //   corner_N: floor south (dy+1) AND east (dx+1)
-                    //   corner_E: floor south (dy+1) AND west (dx-1)
-                    //   corner_S: floor north (dy-1) AND west (dx-1)
-                    //   corner_W: floor north (dy-1) AND east (dx+1)
                     if s && e      { asset_server.load("Isometric/stoneWallCorner_N.png") }
                     else if s && w { asset_server.load("Isometric/stoneWallCorner_E.png") }
                     else if n && w { asset_server.load("Isometric/stoneWallCorner_S.png") }
@@ -455,16 +516,14 @@ fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<Asse
                     else if n      { asset_server.load("Isometric/stoneWall_S.png") }
                     else if e      { asset_server.load("Isometric/stoneWall_W.png") }
                     else if w      { asset_server.load("Isometric/stoneWall_E.png") }
-                    else           { continue; } // interior void — no visible face
+                    else           { continue; }
                 } else {
-                    // Other wall variants have no corner sprites; pick the first
-                    // matching single-face direction.
                     let prefix = tile.wall_asset_prefix();
                     if s      { asset_server.load(format!("Isometric/{prefix}_N.png")) }
                     else if n { asset_server.load(format!("Isometric/{prefix}_S.png")) }
                     else if e { asset_server.load(format!("Isometric/{prefix}_W.png")) }
                     else if w { asset_server.load(format!("Isometric/{prefix}_E.png")) }
-                    else      { continue; } // interior void — no visible face
+                    else      { continue; }
                 };
 
                 let mut entity = commands.spawn((
@@ -473,7 +532,6 @@ fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<Asse
                     Sprite { image, anchor, ..Default::default() },
                     Transform::from_xyz(wx, wy, 0.0).with_scale(Vec3::splat(TILE_SCALE)),
                 ));
-                // Only solid, non-walkable walls participate in occlusion fading.
                 if tile.is_occluding_wall() {
                     entity.insert(WallTile);
                 }
@@ -496,15 +554,13 @@ fn spawn_map_tiles(mut commands: Commands, map: Res<Map>, asset_server: Res<Asse
     }
 }
 
-// ── Startup system: spawn door entities ───────────────────────────────────────
-
-/// Spawns a `Door` entity for every [`DoorPlacement`] in the map and registers
-/// it in [`DoorRegistry`] so movement systems can look up doors by grid position.
-fn spawn_doors(
-    mut commands: Commands,
-    map: Res<Map>,
-    asset_server: Res<AssetServer>,
-    mut registry: ResMut<DoorRegistry>,
+/// Spawns door entities for every [`DoorPlacement`] in `map` and registers
+/// them in `registry`.  Can be called from both startup and level-transition systems.
+pub fn spawn_floor_doors(
+    commands: &mut Commands,
+    map: &Map,
+    asset_server: &AssetServer,
+    registry: &mut DoorRegistry,
 ) {
     let anchor = Anchor::Custom(Vec2::new(0.0, -0.30));
 
@@ -520,7 +576,7 @@ fn spawn_doors(
         let entity = commands
             .spawn((
                 MapTile,
-                WallTile, // fades when occluding the player (removed on open below)
+                WallTile,
                 Door { open: placement.open, facing: placement.facing },
                 YSort,
                 Sprite { image, anchor, ..Default::default() },
@@ -530,6 +586,25 @@ fn spawn_doors(
 
         registry.0.insert((placement.x, placement.y), entity);
     }
+}
+
+// ── Startup system wrappers ───────────────────────────────────────────────────
+
+fn startup_spawn_tiles(
+    mut commands: Commands,
+    dungeon: Res<Dungeon>,
+    asset_server: Res<AssetServer>,
+) {
+    spawn_floor_tiles(&mut commands, dungeon.current_map(), &asset_server);
+}
+
+fn startup_spawn_doors(
+    mut commands: Commands,
+    dungeon: Res<Dungeon>,
+    asset_server: Res<AssetServer>,
+    mut registry: ResMut<DoorRegistry>,
+) {
+    spawn_floor_doors(&mut commands, dungeon.current_map(), &asset_server, &mut registry);
 }
 
 // ── Update system: fade walls that occlude the player ────────────────────────
@@ -546,18 +621,15 @@ fn fade_occluding_walls(
     mut wall_q: Query<(&Transform, &mut Sprite), With<WallTile>>,
 ) {
     const OCCLUDED_ALPHA: f32 = 0.25;
-    const FADE_SPEED: f32 = 10.0; // alpha units per second
+    const FADE_SPEED: f32 = 10.0;
 
     let Ok(player_pos) = player_q.get_single() else {
         return;
     };
-    let player_depth = player_pos.x + player_pos.y; // higher → closer to viewer
-    let player_col   = player_pos.x - player_pos.y; // isometric screen column
+    let player_depth = player_pos.x + player_pos.y;
+    let player_col   = player_pos.x - player_pos.y;
 
     for (transform, mut sprite) in wall_q.iter_mut() {
-        // Recover integer grid coords from the world-space Transform.
-        // wx = (x − y) * ISO_STEP_X  →  x − y = wx / ISO_STEP_X
-        // wy = −(x + y) * ISO_STEP_Y  →  x + y = −wy / ISO_STEP_Y
         let wall_depth = (-transform.translation.y / ISO_STEP_Y).round() as i32;
         let wall_col   = ( transform.translation.x / ISO_STEP_X).round() as i32;
 
@@ -581,10 +653,10 @@ pub struct MapPlugin;
 
 impl Plugin for MapPlugin {
     fn build(&self, app: &mut App) {
-        let map = generate_map();
-        app.insert_resource(map)
+        let dungeon = generate_dungeon(NUM_DUNGEON_FLOORS);
+        app.insert_resource(dungeon)
             .init_resource::<DoorRegistry>()
-            .add_systems(Startup, (spawn_map_tiles, spawn_doors).chain())
+            .add_systems(Startup, (startup_spawn_tiles, startup_spawn_doors).chain())
             .add_systems(Update, fade_occluding_walls);
     }
 }
@@ -642,8 +714,6 @@ mod tests {
 
     #[test]
     fn test_door_tile_is_floor() {
-        // The tile at the door position must be Floor so that is_walkable returns
-        // true when the door is open.
         let map = generate_map();
         let door = &map.doors[0];
         assert!(
@@ -662,8 +732,6 @@ mod tests {
 
     #[test]
     fn test_door_outside_tile_is_floor() {
-        // The tile immediately south of the door (outside the room) must be
-        // Floor so the player can approach from outside.
         let map = generate_map();
         let door = &map.doors[0];
         let outside_y = door.y + 1;
@@ -679,6 +747,79 @@ mod tests {
         );
     }
 
+    // ── Dungeon (multi-floor) ─────────────────────────────────────────────────
+
+    #[test]
+    fn generate_dungeon_has_correct_floor_count() {
+        let dungeon = generate_dungeon(3);
+        assert_eq!(dungeon.floors.len(), 3);
+    }
+
+    #[test]
+    fn dungeon_starts_on_floor_zero() {
+        let dungeon = generate_dungeon(2);
+        assert_eq!(dungeon.current_floor, 0);
+    }
+
+    #[test]
+    fn stairs_down_placed_on_all_but_last_floor() {
+        let dungeon = generate_dungeon(3);
+        for f in 0..2 {
+            let has_stairs_down = dungeon.floors[f]
+                .stair_links
+                .values()
+                .any(|link| link.target_floor == f + 1);
+            assert!(has_stairs_down, "floor {f} must have a StairsDown link to floor {}", f + 1);
+        }
+    }
+
+    #[test]
+    fn stairs_links_are_bidirectional() {
+        let dungeon = generate_dungeon(3);
+        for f in 0..2 {
+            for (&pos, link) in &dungeon.floors[f].stair_links {
+                if link.target_floor == f + 1 {
+                    // The target floor must have a link back to f at the landing position.
+                    let back = dungeon.floors[f + 1]
+                        .stair_links
+                        .get(&link.target_pos)
+                        .expect("target floor must have a return stair link");
+                    assert_eq!(back.target_floor, f);
+                    assert_eq!(back.target_pos, pos);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stair_tiles_are_walkable() {
+        let dungeon = generate_dungeon(2);
+        // StairsDown on floor 0
+        for (&(x, y), link) in &dungeon.floors[0].stair_links {
+            if link.target_floor == 1 {
+                assert!(
+                    dungeon.floors[0].is_walkable(x, y),
+                    "StairsDown at ({x},{y}) must be walkable"
+                );
+            }
+        }
+        // StairsUp on floor 1
+        for (&(x, y), link) in &dungeon.floors[1].stair_links {
+            if link.target_floor == 0 {
+                assert!(
+                    dungeon.floors[1].is_walkable(x, y),
+                    "StairsUp at ({x},{y}) must be walkable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn single_floor_dungeon_has_no_stairs() {
+        let dungeon = generate_dungeon(1);
+        assert!(dungeon.floors[0].stair_links.is_empty());
+    }
+
     // ── TileType::is_walkable ─────────────────────────────────────────────────
 
     #[test]
@@ -688,7 +829,8 @@ mod tests {
             TileType::Dirt,
             TileType::Planks,
             TileType::Bridge,
-            TileType::Stairs,
+            TileType::StairsDown,
+            TileType::StairsUp,
             TileType::DoorOpen,
             TileType::Archway,
         ] {
@@ -730,7 +872,8 @@ mod tests {
             TileType::Dirt,
             TileType::Planks,
             TileType::Bridge,
-            TileType::Stairs,
+            TileType::StairsDown,
+            TileType::StairsUp,
         ] {
             assert!(t.is_floor_like());
             let p = t.floor_asset_prefix();

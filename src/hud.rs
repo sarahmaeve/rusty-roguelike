@@ -2,7 +2,7 @@ use std::f32::consts::FRAC_PI_4;
 
 use bevy::prelude::*;
 
-use crate::player::PlayerMoving;
+use crate::{map::Dungeon, player::PlayerMoving};
 
 // ── Tunables ──────────────────────────────────────────────────────────────────
 
@@ -36,6 +36,10 @@ struct CompassFg;
 /// Marks text labels — excluded from background-color updates.
 #[derive(Component)]
 struct CompassLabel;
+
+/// Marks the floor-indicator text node in the top-left corner.
+#[derive(Component)]
+struct FloorLabel;
 
 // ── Type aliases ──────────────────────────────────────────────────────────────
 
@@ -165,6 +169,38 @@ fn spawn_label(parent: &mut ChildBuilder, text: &str, corner: Corner) {
     ));
 }
 
+// ── Startup: floor label ──────────────────────────────────────────────────────
+
+fn spawn_floor_label(mut commands: Commands, dungeon: Res<Dungeon>) {
+    let total = dungeon.floors.len();
+    commands.spawn((
+        FloorLabel,
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(20.0),
+            top: Val::Px(20.0),
+            ..Default::default()
+        },
+        Text::new(format!("Floor 1 / {total}")),
+        TextFont { font_size: 16.0, ..Default::default() },
+        TextColor(Color::srgba(FG.0, FG.1, FG.2, 0.85)),
+    ));
+}
+
+// ── Update: floor label ───────────────────────────────────────────────────────
+
+fn update_floor_label(
+    dungeon: Res<Dungeon>,
+    mut label_q: Query<&mut Text, With<FloorLabel>>,
+) {
+    if !dungeon.is_changed() {
+        return;
+    }
+    let Ok(mut text) = label_q.get_single_mut() else { return; };
+    let total = dungeon.floors.len();
+    **text = format!("Floor {} / {total}", dungeon.current_floor + 1);
+}
+
 // ── Update: fade compass in/out based on movement state ───────────────────────
 
 fn update_compass_alpha(
@@ -198,7 +234,7 @@ pub struct HudPlugin;
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(CompassAlpha(0.0))
-            .add_systems(Startup, spawn_compass)
-            .add_systems(Update, update_compass_alpha);
+            .add_systems(Startup, (spawn_compass, spawn_floor_label))
+            .add_systems(Update, (update_compass_alpha, update_floor_label));
     }
 }
