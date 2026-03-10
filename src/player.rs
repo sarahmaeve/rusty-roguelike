@@ -4,7 +4,8 @@ use bevy::{ecs::system::SystemParam, prelude::*, sprite::Anchor, window::Primary
 use bevy_light_2d::prelude::*;
 
 use crate::{
-    components::{CharacterKind, Door, MainCamera, MapPosition, MapTile, Player, StairsMidTile, StairsUpTile, YSort, YSortBias},
+    components::{CharacterKind, ChestContents, Door, MainCamera, MapPosition, MapTile, Player, PropTile, StairsMidTile, StairsUpTile, YSort, YSortBias},
+    inventory::Inventory,
     map::{spawn_floor_doors, spawn_floor_tiles, DoorRegistry, Dungeon, Map, TileType},
     ISO_STEP_X, ISO_STEP_Y, TILE_SCALE,
 };
@@ -1031,6 +1032,44 @@ fn apply_light_type(
     }
 }
 
+// ── Update system: open adjacent chests ──────────────────────────────────────
+
+/// Press **E** to open a closed chest adjacent (4-directional) to the player.
+///
+/// Opening a chest:
+/// - Swaps the sprite to `chestOpen_*` using the stored facing direction.
+/// - Transfers the contained item into [`Inventory`] (no-op if full).
+/// - Removes the [`ChestContents`] component so the chest cannot be opened again.
+fn interact_with_chests(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    player_q: Query<&MapPosition, With<Player>>,
+    dungeon: Res<Dungeon>,
+    mut chest_q: Query<(Entity, &MapPosition, &ChestContents, &mut Sprite), With<PropTile>>,
+    mut inventory: ResMut<Inventory>,
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+) {
+    if !keyboard.just_pressed(KeyCode::KeyE) {
+        return;
+    }
+    let Ok(pos) = player_q.get_single() else { return };
+    let map = dungeon.current_map();
+    if map.tiles[map.idx(pos.x, pos.y)].is_stair() {
+        return;
+    }
+
+    for (entity, chest_pos, contents, mut sprite) in &mut chest_q {
+        let dx = (chest_pos.x - pos.x).abs();
+        let dy = (chest_pos.y - pos.y).abs();
+        if dx + dy == 1 && inventory.add(contents.item) {
+            let dir = contents.facing.as_str();
+            sprite.image = asset_server.load(format!("Isometric/chestOpen_{dir}.png"));
+            commands.entity(entity).remove::<ChestContents>();
+            break;
+        }
+    }
+}
+
 // ── Update system: interact with adjacent doors ───────────────────────────────
 
 /// Press **E** to toggle a door adjacent (4-directional) to the player.
@@ -1264,6 +1303,7 @@ impl Plugin for PlayerPlugin {
                     animate_player,
                     interact_with_stairs,
                     execute_level_transition.after(interact_with_stairs),
+                    interact_with_chests.after(interact_with_stairs),
                     interact_with_doors.after(interact_with_stairs),
                     toggle_light_type,
                     flicker_torch.after(toggle_light_type),

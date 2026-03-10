@@ -4,7 +4,7 @@ use bevy::{prelude::*, sprite::Anchor};
 use rand::Rng;
 
 use crate::{
-    components::{CardinalDir, Door, MapPosition, MapTile, Player, PropTile, StairsMidTile, StairsUpTile, WallTile, YSort, YSortBias},
+    components::{CardinalDir, ChestContents, Door, ItemKind, MapPosition, MapTile, Player, PropTile, StairsMidTile, StairsUpTile, WallTile, YSort, YSortBias},
     ISO_STEP_X, ISO_STEP_Y, MAP_HEIGHT, MAP_WIDTH, TILE_SCALE,
 };
 
@@ -283,6 +283,9 @@ pub struct Map {
     pub rooms: Vec<Rect>,
     /// Maps stair tile positions on this floor to their traversal options.
     pub stair_links: HashMap<(i32, i32), StairNode>,
+    /// Items stored inside closed chests, keyed by grid position.
+    /// Tuple: (item kind, sprite facing direction for the open-chest asset).
+    pub chest_items: HashMap<(i32, i32), (ItemKind, CardinalDir)>,
 }
 
 impl Map {
@@ -296,6 +299,7 @@ impl Map {
             doors: Vec::new(),
             rooms: Vec::new(),
             stair_links: HashMap::new(),
+            chest_items: HashMap::new(),
         }
     }
 
@@ -406,6 +410,7 @@ pub fn generate_map() -> Map {
     }
 
     place_test_door(&mut map);
+    place_test_chest(&mut map);
 
     map
 }
@@ -508,6 +513,25 @@ fn place_test_door(map: &mut Map) {
     });
 }
 
+/// Places a closed chest containing a key one tile east of the first room's
+/// centre.  The chest blocks movement (it sits in `Map::props`) and its
+/// contents are recorded in `Map::chest_items` so `spawn_floor_tiles` can
+/// attach the [`ChestContents`] component to the spawned entity.
+fn place_test_chest(map: &mut Map) {
+    let Some(room) = map.rooms.first().copied() else { return };
+    let cx = (room.x1 + room.x2) / 2;
+    let cy = (room.y1 + room.y2) / 2;
+    let chest_x = cx + 1;
+    let chest_y = cy;
+
+    if !map.in_bounds(chest_x, chest_y) { return }
+    if !map.is_walkable(chest_x, chest_y) { return }
+
+    let idx = map.idx(chest_x, chest_y);
+    map.props[idx] = Some(PropType::ChestClosed);
+    map.chest_items.insert((chest_x, chest_y), (ItemKind::Key, CardinalDir::N));
+}
+
 // ── Tile/door spawning (pub: called from startup and level-transition) ─────────
 
 /// Spawns isometric tile sprites for all cells in `map`.  Can be called from
@@ -581,16 +605,25 @@ pub fn spawn_floor_tiles(commands: &mut Commands, map: &Map, asset_server: &Asse
 
             // ── Prop ──────────────────────────────────────────────────────────
             if let Some(prop) = map.props[map.idx(x, y)] {
-                let dir = DIRS[rng.gen_range(0..4)];
+                // Chest props with recorded contents use a fixed facing so the
+                // open-chest sprite can be loaded correctly; all others random.
+                let chest = map.chest_items.get(&(x, y));
+                let dir = chest
+                    .map(|(_, d)| d.as_str())
+                    .unwrap_or_else(|| DIRS[rng.gen_range(0..4)]);
                 let image = asset_server
                     .load(format!("Isometric/{}_{dir}.png", prop.asset_prefix()));
-                commands.spawn((
+                let mut entity = commands.spawn((
                     MapTile,
                     PropTile,
                     YSort,
+                    MapPosition::new(x, y),
                     Sprite { image, anchor, ..Default::default() },
                     Transform::from_xyz(wx, wy, 0.0).with_scale(Vec3::splat(TILE_SCALE)),
                 ));
+                if let Some(&(item, facing)) = chest {
+                    entity.insert(ChestContents { item, facing });
+                }
             }
         }
     }

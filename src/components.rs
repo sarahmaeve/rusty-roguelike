@@ -93,6 +93,33 @@ pub struct Door {
     pub facing: CardinalDir,
 }
 
+/// Every kind of item that can be held in the player's inventory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum ItemKind {
+    Key,
+}
+
+impl ItemKind {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Key => "Key",
+        }
+    }
+}
+
+/// Marks a world entity as a loose item that can be picked up by the player.
+#[derive(Component)]
+pub struct Item(pub ItemKind);
+
+/// Placed on a closed chest prop entity to record what is stored inside.
+/// The `facing` field is used to load the matching `chestOpen_*` asset when
+/// the chest is opened.  Removed when the contents enter the player's inventory.
+#[derive(Component, Clone, Copy)]
+pub struct ChestContents {
+    pub item:   ItemKind,
+    pub facing: CardinalDir,
+}
+
 /// Discrete tile-grid position for any entity on the map.
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MapPosition {
