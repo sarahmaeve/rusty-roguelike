@@ -51,6 +51,13 @@ const FEMALE_RUN_FRAME_COUNT: usize = 20;
 const FEMALE_IDLE_FRAME_COUNT: usize = 16;
 /// Cell size of each Female spritesheet frame, in pixels.
 const FEMALE_CELL_PX: u32 = 256;
+/// Sprite anchor for the Female character.
+///
+/// Bevy anchor coordinates: −0.5 = bottom edge, +0.5 = top edge.
+/// The Female 256×256 cells have empty space below the feet; the feet sit at
+/// roughly 32 % from the bottom, giving an anchor of −0.5 + 0.32 = −0.18.
+/// Tune this value if the character still floats or sinks into the floor.
+const FEMALE_ANCHOR: Vec2 = Vec2::new(0.0, -0.18);
 /// Degree values matching the Female asset filename suffixes.
 const FEMALE_ANGLES: [u32; FEMALE_DIR_COUNT] = [
     0, 22, 45, 67, 90, 112, 135, 157, 180, 202, 225, 247, 270, 292, 315, 337,
@@ -488,9 +495,7 @@ fn spawn_player(
                     layout: idle_layout,
                     index: 0,
                 }),
-                // Ground-contact point at the feet, matching the isometric
-                // tile anchor convention so the character stands on the floor.
-                anchor: Anchor::Custom(Vec2::new(0.0, -0.30)),
+                anchor: Anchor::Custom(FEMALE_ANCHOR),
                 ..Default::default()
             },
             Transform::from_xyz(world.x, world.y, 0.0).with_scale(Vec3::splat(TILE_SCALE)),
@@ -512,7 +517,7 @@ fn spawn_player(
                         layout: walk_layout,
                         index: 0,
                     }),
-                    anchor: Anchor::Custom(Vec2::new(0.0, -0.30)),
+                    anchor: Anchor::Custom(FEMALE_ANCHOR),
                     ..Default::default()
                 },
                 Transform::from_xyz(0.0, 0.0, -0.001),
