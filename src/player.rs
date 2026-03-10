@@ -768,20 +768,19 @@ fn auto_step(
 
 // ── Update system: drive the sprite animation ─────────────────────────────────
 
+type AnimatePlayerItem = (
+    &'static mut Sprite,
+    &'static mut PlayerAnimation,
+    &'static CharacterKind,
+    Option<&'static PlayerSprites>,
+    Option<&'static FemaleSprites>,
+    Option<&'static Children>,
+);
+
 fn animate_player(
     time: Res<Time>,
     mut moving: ResMut<PlayerMoving>,
-    mut player_q: Query<
-        (
-            &mut Sprite,
-            &mut PlayerAnimation,
-            &CharacterKind,
-            Option<&PlayerSprites>,
-            Option<&FemaleSprites>,
-            Option<&Children>,
-        ),
-        With<Player>,
-    >,
+    mut player_q: Query<AnimatePlayerItem, With<Player>>,
     mut shadow_q: Query<&mut Sprite, (With<PlayerShadow>, Without<Player>)>,
 ) {
     let Ok((mut sprite, mut anim, kind, male_sprites, female_sprites, children)) =
@@ -1166,13 +1165,17 @@ fn execute_level_transition(
 ///   entity (those with `intensity > 0`), using each segment's own world
 ///   position and `PointLight2d` radius.  This correctly restricts visibility
 ///   to the beam direction rather than a full ring.
+type CullTileItem = (
+    &'static Transform,
+    &'static mut Visibility,
+    Option<&'static StairsUpTile>,
+    Option<&'static StairsMidTile>,
+);
+
 fn cull_map_tiles(
     player_q: Query<(&Transform, &PointLight2d, &LightType), With<Player>>,
     beam_q: Query<(&Transform, &PointLight2d), With<LanternBeamLight>>,
-    mut tile_q: Query<
-        (&Transform, &mut Visibility, Option<&StairsUpTile>, Option<&StairsMidTile>),
-        With<MapTile>,
-    >,
+    mut tile_q: Query<CullTileItem, With<MapTile>>,
 ) {
     let Ok((player_tf, player_light, light_type)) = player_q.get_single() else {
         return;
