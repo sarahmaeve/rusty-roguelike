@@ -122,15 +122,26 @@ impl FacingDir {
     /// clockwise.  If the in-game sprites point the wrong way, adjust the values
     /// in the `match` arm below.
     fn to_female_dir_index(self) -> usize {
+        // The Female asset pack uses 0° = screen-up (NW in isometric), rotating
+        // clockwise.  Derived from the projection world_x=(dx-dy)*ISO_STEP_X,
+        // world_y=-(dx+dy)*ISO_STEP_Y:
+        //   NW → pure up     →   0°
+        //   N  → right+up    →  45°
+        //   NE → pure right  →  90°
+        //   E  → right+down  → 135°
+        //   SE → pure down   → 180°
+        //   S  → left+down   → 225°
+        //   SW → pure left   → 270°
+        //   W  → left+up     → 315°
         let deg: u32 = match self {
-            FacingDir::East      =>   0,
-            FacingDir::SouthEast =>  45,
-            FacingDir::South     =>  90,
-            FacingDir::SouthWest => 135,
-            FacingDir::West      => 180,
-            FacingDir::NorthWest => 225,
-            FacingDir::North     => 270,
-            FacingDir::NorthEast => 315,
+            FacingDir::NorthWest =>   0,
+            FacingDir::North     =>  45,
+            FacingDir::NorthEast =>  90,
+            FacingDir::East      => 135,
+            FacingDir::SouthEast => 180,
+            FacingDir::South     => 225,
+            FacingDir::SouthWest => 270,
+            FacingDir::West      => 315,
         };
         FEMALE_ANGLES
             .iter()
