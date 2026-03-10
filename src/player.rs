@@ -45,6 +45,8 @@ const RUN_FRAME_SECS: f32 = 0.1;
 const FEMALE_DIR_COUNT: usize = 16;
 /// Frames in each Female walk spritesheet (6 columns × 4 rows).
 const FEMALE_WALK_FRAME_COUNT: usize = 24;
+/// Frames in each Female run spritesheet (5 columns × 4 rows).
+const FEMALE_RUN_FRAME_COUNT: usize = 20;
 /// Frames in each Female idle spritesheet (4 columns × 4 rows).
 const FEMALE_IDLE_FRAME_COUNT: usize = 16;
 /// Cell size of each Female spritesheet frame, in pixels.
@@ -179,18 +181,28 @@ struct FemaleSprites {
     walk_body:   [Handle<Image>; FEMALE_DIR_COUNT],
     /// Shadow layer walk sheets, one per direction.
     walk_shadow: [Handle<Image>; FEMALE_DIR_COUNT],
+    /// Body layer run sheets, one per direction (5×4 grid, 256×256 px cells).
+    run_body:    [Handle<Image>; FEMALE_DIR_COUNT],
+    /// Shadow layer run sheets, one per direction.
+    run_shadow:  [Handle<Image>; FEMALE_DIR_COUNT],
     /// Shared atlas layout for all idle sheets (4 columns × 4 rows).
     idle_layout: Handle<TextureAtlasLayout>,
     /// Shared atlas layout for all walk sheets (6 columns × 4 rows).
     walk_layout: Handle<TextureAtlasLayout>,
+    /// Shared atlas layout for all run sheets (5 columns × 4 rows).
+    run_layout:  Handle<TextureAtlasLayout>,
 }
 
 #[derive(Component)]
 struct PlayerAnimation {
     facing: FacingDir,
+    /// True while the player is in motion (walk or run); false when idle.
     running: bool,
+    /// True when motion was triggered by mouse auto-travel (run animation);
+    /// false when triggered by keyboard (walk animation).
+    auto_running: bool,
     frame: usize,
-    /// Advances through run frames while running.
+    /// Advances through animation frames while moving.
     frame_timer: Timer,
     /// Reset on each step; idle resumes when this expires.
     run_cooldown: Timer,
@@ -206,6 +218,7 @@ impl PlayerAnimation {
         Self {
             facing: FacingDir::default(),
             running: false,
+            auto_running: false,
             frame: 0,
             frame_timer: Timer::from_seconds(RUN_FRAME_SECS, TimerMode::Repeating),
             run_cooldown: Timer::from_seconds(
@@ -217,10 +230,19 @@ impl PlayerAnimation {
         }
     }
 
-    /// Call when the player takes a step to (re)start the run animation.
-    fn trigger(&mut self, facing: FacingDir) {
+    /// Keyboard step: plays the walk animation.
+    fn trigger_walk(&mut self, facing: FacingDir) {
         self.facing = facing;
         self.running = true;
+        self.auto_running = false;
+        self.run_cooldown.reset();
+    }
+
+    /// Auto-travel step (mouse double-click): plays the run animation.
+    fn trigger_run(&mut self, facing: FacingDir) {
+        self.facing = facing;
+        self.running = true;
+        self.auto_running = true;
         self.run_cooldown.reset();
     }
 }
@@ -388,6 +410,14 @@ fn spawn_player(
         None,
         None,
     ));
+    // Run sheets: 5 columns × 4 rows, each cell 256×256 px → 20 frames.
+    let run_layout = layouts.add(TextureAtlasLayout::from_grid(
+        UVec2::splat(FEMALE_CELL_PX),
+        5,
+        4,
+        None,
+        None,
+    ));
 
     let idle_body: [Handle<Image>; FEMALE_DIR_COUNT] = std::array::from_fn(|i| {
         asset_server.load(format!(
@@ -413,6 +443,18 @@ fn spawn_player(
             FEMALE_ANGLES[i]
         ))
     });
+    let run_body: [Handle<Image>; FEMALE_DIR_COUNT] = std::array::from_fn(|i| {
+        asset_server.load(format!(
+            "Characters/Female/RunUnarmed/Run_Unarmed_Body_{:03}.png",
+            FEMALE_ANGLES[i]
+        ))
+    });
+    let run_shadow: [Handle<Image>; FEMALE_DIR_COUNT] = std::array::from_fn(|i| {
+        asset_server.load(format!(
+            "Characters/Female/RunUnarmed/Run_Unarmed_Shadow_{:03}.png",
+            FEMALE_ANGLES[i]
+        ))
+    });
 
     let initial_dir = FacingDir::South.to_female_dir_index();
     let initial_body   = idle_body[initial_dir].clone();
@@ -423,8 +465,11 @@ fn spawn_player(
         idle_shadow,
         walk_body,
         walk_shadow,
+        run_body,
+        run_shadow,
         idle_layout: idle_layout.clone(),
         walk_layout: walk_layout.clone(),
+        run_layout: run_layout.clone(),
     };
 
     commands
@@ -624,7 +669,7 @@ fn player_movement(
         let world = pos.to_world(0.0);
         transform.translation.x = world.x;
         transform.translation.y = world.y;
-        anim.trigger(facing);
+        anim.trigger_walk(facing);
     } else {
         anim.facing = facing;
     }
@@ -712,7 +757,7 @@ fn auto_step(
     let world = pos.to_world(0.0);
     transform.translation.x = world.x;
     transform.translation.y = world.y;
-    anim.trigger(facing);
+    anim.trigger_run(facing);
 }
 
 // ── Update system: drive the sprite animation ─────────────────────────────────
@@ -771,11 +816,13 @@ fn animate_player(
             let Some(sprites) = female_sprites else { return };
             let dir_i = anim.facing.to_female_dir_index();
 
-            // Advance the frame timer for both idle and walk — Female idle is
-            // also an animated loop (16 frames), unlike the Male single frame.
+            // Advance the frame timer for all states — idle is also a 16-frame
+            // animated loop, unlike the Male single-frame idle.
             anim.frame_timer.tick(time.delta());
             if anim.frame_timer.just_finished() {
-                let max = if anim.running {
+                let max = if anim.running && anim.auto_running {
+                    FEMALE_RUN_FRAME_COUNT
+                } else if anim.running {
                     FEMALE_WALK_FRAME_COUNT
                 } else {
                     FEMALE_IDLE_FRAME_COUNT
@@ -783,7 +830,13 @@ fn animate_player(
                 anim.frame = (anim.frame + 1) % max;
             }
 
-            let (body_img, shadow_img, layout) = if anim.running {
+            let (body_img, shadow_img, layout) = if anim.running && anim.auto_running {
+                (
+                    sprites.run_body[dir_i].clone(),
+                    sprites.run_shadow[dir_i].clone(),
+                    sprites.run_layout.clone(),
+                )
+            } else if anim.running {
                 (
                     sprites.walk_body[dir_i].clone(),
                     sprites.walk_shadow[dir_i].clone(),
