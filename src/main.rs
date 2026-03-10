@@ -6,7 +6,7 @@ mod player;
 
 use bevy::prelude::*;
 use bevy_light_2d::prelude::*;
-use components::YSort;
+use components::{YSort, YSortBias};
 
 use camera::CameraPlugin;
 use hud::HudPlugin;
@@ -27,9 +27,9 @@ pub const MAP_HEIGHT: i32 = 22;
 
 /// Y-sort: entities lower on screen (more negative world Y) render in front.
 /// In isometric layout, lower on screen = higher col+row = correct depth order.
-fn y_sort(mut query: Query<&mut Transform, With<YSort>>) {
-    for mut tf in query.iter_mut() {
-        tf.translation.z = -tf.translation.y / 10_000.0;
+fn y_sort(mut query: Query<(&mut Transform, Option<&YSortBias>), With<YSort>>) {
+    for (mut tf, bias) in query.iter_mut() {
+        tf.translation.z = -tf.translation.y / 10_000.0 + bias.map_or(0.0, |b| b.0);
     }
 }
 

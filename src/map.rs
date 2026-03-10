@@ -4,7 +4,7 @@ use bevy::{prelude::*, sprite::Anchor};
 use rand::Rng;
 
 use crate::{
-    components::{CardinalDir, Door, MapPosition, MapTile, Player, PropTile, StairsMidTile, StairsUpTile, WallTile, YSort},
+    components::{CardinalDir, Door, MapPosition, MapTile, Player, PropTile, StairsMidTile, StairsUpTile, WallTile, YSort, YSortBias},
     ISO_STEP_X, ISO_STEP_Y, MAP_HEIGHT, MAP_WIDTH, TILE_SCALE,
 };
 
@@ -621,6 +621,7 @@ pub fn spawn_floor_doors(
                 WallTile,
                 Door { open: placement.open, facing: placement.facing },
                 YSort,
+                YSortBias(-0.001),
                 Sprite { image, anchor, ..Default::default() },
                 Transform::from_xyz(wx, wy, 0.0).with_scale(Vec3::splat(TILE_SCALE)),
             ))

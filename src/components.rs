@@ -22,6 +22,16 @@ pub struct MainCamera;
 #[derive(Component)]
 pub struct YSort;
 
+/// Optional additive Z offset applied on top of the Y-sort result.
+///
+/// Use this to break depth ties between entities that share the same world Y
+/// (e.g. a player standing on a door tile).  Positive values push the entity
+/// in front; negative values push it behind.  Keep the magnitude well below
+/// one Y-sort tile step (≈ 0.0032) so that correct cross-tile ordering is
+/// preserved.
+#[derive(Component)]
+pub struct YSortBias(pub f32);
+
 /// Marks a wall tile sprite so the occlusion system can fade it when it lies
 /// between the camera and the player.
 #[derive(Component)]

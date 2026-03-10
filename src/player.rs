@@ -4,7 +4,7 @@ use bevy::{ecs::system::SystemParam, prelude::*, sprite::Anchor, window::Primary
 use bevy_light_2d::prelude::*;
 
 use crate::{
-    components::{CharacterKind, Door, MainCamera, MapPosition, MapTile, Player, StairsMidTile, StairsUpTile, YSort},
+    components::{CharacterKind, Door, MainCamera, MapPosition, MapTile, Player, StairsMidTile, StairsUpTile, YSort, YSortBias},
     map::{spawn_floor_doors, spawn_floor_tiles, DoorRegistry, Dungeon, Map, TileType},
     ISO_STEP_X, ISO_STEP_Y, TILE_SCALE,
 };
@@ -484,6 +484,7 @@ fn spawn_player(
             Player,
             CharacterKind::Female,
             YSort,
+            YSortBias(0.001),
             pos,
             female_sprites,
             PlayerAnimation::new(),
