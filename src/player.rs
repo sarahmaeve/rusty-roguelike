@@ -4,8 +4,8 @@ use bevy::{ecs::system::SystemParam, prelude::*, sprite::Anchor, window::Primary
 use bevy_light_2d::prelude::*;
 
 use crate::{
-    components::{CharacterKind, ChestContents, Door, MainCamera, MapPosition, MapTile, Player, PropTile, StairsMidTile, StairsUpTile, YSort, YSortBias},
-    inventory::Inventory,
+    components::{CharacterKind, ChestContents, Door, DoorState, ItemKind, MainCamera, MapPosition, MapTile, Player, PropTile, StairsMidTile, StairsUpTile, YSort, YSortBias},
+    inventory::{Inventory, SelectedSlot, UseItemEvent},
     map::{spawn_floor_doors, spawn_floor_tiles, DoorRegistry, Dungeon, Map, TileType},
     ISO_STEP_X, ISO_STEP_Y, TILE_SCALE,
 };
@@ -397,7 +397,7 @@ fn closed_door_positions(
         .0
         .iter()
         .filter(|(_, entity)| {
-            door_q.get(**entity).map(|d| !d.open).unwrap_or(false)
+            door_q.get(**entity).map(|d| !d.is_passable()).unwrap_or(false)
         })
         .map(|(&pos, _)| pos)
         .collect()
@@ -635,7 +635,7 @@ impl DoorParams<'_, '_> {
             .0
             .get(&pos)
             .and_then(|&e| self.doors.get(e).ok())
-            .is_some_and(|d| !d.open)
+            .is_some_and(|d| !d.is_passable())
     }
 }
 
@@ -705,6 +705,9 @@ fn handle_mouse_click(
     dungeon: Res<Dungeon>,
     doors: DoorParams<'_, '_>,
     mut click_state: ResMut<ClickState>,
+    inventory: Res<Inventory>,
+    mut selected_slot: ResMut<SelectedSlot>,
+    mut use_item_events: EventWriter<UseItemEvent>,
     mut player_q: Query<(&MapPosition, &mut PlayerAnimation), With<Player>>,
 ) {
     if !mouse.just_pressed(MouseButton::Left) {
@@ -713,14 +716,6 @@ fn handle_mouse_click(
 
     let Some(world_pos) = cursor.world_pos() else { return; };
 
-    let now = time.elapsed_secs();
-    let is_double = (now - click_state.last_click_time) < DOUBLE_CLICK_SECS;
-    click_state.last_click_time = now;
-
-    if !is_double {
-        return;
-    }
-
     // Invert the isometric projection:
     //   wx = (gx - gy) * ISO_STEP_X  →  gx - gy = wx / ISO_STEP_X
     //   wy = -(gx + gy) * ISO_STEP_Y →  gx + gy = -wy / ISO_STEP_Y
@@ -728,6 +723,25 @@ fn handle_mouse_click(
     let diff =  world_pos.x / ISO_STEP_X;
     let target_x = ((diff + sum) / 2.0).round() as i32;
     let target_y = ((sum  - diff) / 2.0).round() as i32;
+
+    // If an inventory item is selected, use it on the clicked tile (any tile).
+    if let Some(slot_idx) = selected_slot.0 {
+        if let Some(&item) = inventory.items().get(slot_idx) {
+            use_item_events.send(UseItemEvent { item, target: (target_x, target_y) });
+            selected_slot.0 = None;
+            return;
+        }
+        // Slot no longer has an item — clear stale selection and fall through.
+        selected_slot.0 = None;
+    }
+
+    let now = time.elapsed_secs();
+    let is_double = (now - click_state.last_click_time) < DOUBLE_CLICK_SECS;
+    click_state.last_click_time = now;
+
+    if !is_double {
+        return;
+    }
 
     let map = dungeon.current_map();
     if !map.is_passable(target_x, target_y) {
@@ -1075,7 +1089,8 @@ fn interact_with_chests(
 /// Press **E** to toggle a door adjacent (4-directional) to the player.
 ///
 /// - Swaps the sprite between `stoneWallDoorOpen_*` and `stoneWallDoorClosed_*`.
-/// - Flips `door.open`.
+/// - Cycles `door.state` between [`DoorState::Closed`] and [`DoorState::Open`].
+/// - Locked doors are silently skipped — use the correct item to unlock first.
 /// - Only one door is toggled per keypress (the first match in NESW order).
 /// - Does nothing when the player is standing on a stair tile (stairs take priority).
 fn interact_with_doors(
@@ -1108,11 +1123,48 @@ fn interact_with_doors(
             continue;
         };
 
-        door.open = !door.open;
-        let state = if door.open { "Open" } else { "Closed" };
+        // Locked doors cannot be toggled with E.
+        if door.state == DoorState::Locked {
+            break;
+        }
+
+        door.state = match door.state {
+            DoorState::Closed => DoorState::Open,
+            DoorState::Open   => DoorState::Closed,
+            DoorState::Locked => unreachable!(),
+        };
+        let state_str = if door.state == DoorState::Open { "Open" } else { "Closed" };
         let dir = door.facing.as_str();
-        sprite.image = asset_server.load(format!("Isometric/stoneWallDoor{state}_{dir}.png"));
+        sprite.image = asset_server.load(format!("Isometric/stoneWallDoor{state_str}_{dir}.png"));
         break; // one door per keypress
+    }
+}
+
+// ── Update system: apply item use ─────────────────────────────────────────────
+
+/// Handles [`UseItemEvent`] fired when the player uses an inventory item on a
+/// world tile.  Currently only the Key→Locked-door interaction is implemented.
+fn apply_item_use(
+    mut events: EventReader<UseItemEvent>,
+    mut inventory: ResMut<Inventory>,
+    door_registry: Res<DoorRegistry>,
+    mut door_q: Query<(&mut Door, &mut Sprite)>,
+    asset_server: Res<AssetServer>,
+) {
+    for ev in events.read() {
+        match ev.item {
+            ItemKind::Key => {
+                let Some(&entity) = door_registry.0.get(&ev.target) else { continue };
+                let Ok((mut door, mut sprite)) = door_q.get_mut(entity) else { continue };
+                if door.state == DoorState::Locked {
+                    door.state = DoorState::Closed;
+                    let dir = door.facing.as_str();
+                    sprite.image =
+                        asset_server.load(format!("Isometric/stoneWallDoorClosed_{dir}.png"));
+                    inventory.remove(ev.item);
+                }
+            }
+        }
     }
 }
 
@@ -1305,6 +1357,7 @@ impl Plugin for PlayerPlugin {
                     execute_level_transition.after(interact_with_stairs),
                     interact_with_chests.after(interact_with_stairs),
                     interact_with_doors.after(interact_with_stairs),
+                    apply_item_use,
                     toggle_light_type,
                     flicker_torch.after(toggle_light_type),
                     apply_light_type.after(toggle_light_type),

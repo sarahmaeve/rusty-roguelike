@@ -4,7 +4,7 @@ use bevy::{prelude::*, sprite::Anchor};
 use rand::Rng;
 
 use crate::{
-    components::{CardinalDir, ChestContents, Door, ItemKind, MapPosition, MapTile, Player, PropTile, StairsMidTile, StairsUpTile, WallTile, YSort, YSortBias},
+    components::{CardinalDir, ChestContents, Door, DoorState, ItemKind, MapPosition, MapTile, Player, PropTile, StairsMidTile, StairsUpTile, WallTile, YSort, YSortBias},
     ISO_STEP_X, ISO_STEP_Y, MAP_HEIGHT, MAP_WIDTH, TILE_SCALE,
 };
 
@@ -223,6 +223,9 @@ pub struct DoorPlacement {
     pub x: i32,
     pub y: i32,
     pub open: bool,
+    /// When `true` the door starts in [`DoorState::Locked`] and cannot be
+    /// toggled with **E** until unlocked by using the correct item on it.
+    pub locked: bool,
     /// Sprite face direction — matches the asset suffix convention (`_N` etc.)
     /// and is determined by which adjacent tile holds the room interior.
     pub facing: CardinalDir,
@@ -509,6 +512,7 @@ fn place_test_door(map: &mut Map) {
         x: cx,
         y: door_y,
         open: false,
+        locked: true,
         facing,
     });
 }
@@ -643,16 +647,24 @@ pub fn spawn_floor_doors(
         let wx = (placement.x as f32 - placement.y as f32) * ISO_STEP_X;
         let wy = -(placement.x as f32 + placement.y as f32) * ISO_STEP_Y;
 
-        let state = if placement.open { "Open" } else { "Closed" };
+        let door_state = if placement.open {
+            DoorState::Open
+        } else if placement.locked {
+            DoorState::Locked
+        } else {
+            DoorState::Closed
+        };
+        // Locked doors use the Closed sprite (locked visual is the same frame).
+        let state_str = if door_state == DoorState::Open { "Open" } else { "Closed" };
         let dir = placement.facing.as_str();
         let image =
-            asset_server.load(format!("Isometric/stoneWallDoor{state}_{dir}.png"));
+            asset_server.load(format!("Isometric/stoneWallDoor{state_str}_{dir}.png"));
 
         let entity = commands
             .spawn((
                 MapTile,
                 WallTile,
-                Door { open: placement.open, facing: placement.facing },
+                Door { state: door_state, facing: placement.facing },
                 YSort,
                 YSortBias(-0.001),
                 Sprite { image, anchor, ..Default::default() },
@@ -801,9 +813,10 @@ mod tests {
     }
 
     #[test]
-    fn test_door_starts_closed() {
+    fn test_door_starts_locked() {
         let map = generate_map();
-        assert!(!map.doors[0].open, "test door should start closed");
+        assert!(map.doors[0].locked, "test door should start locked");
+        assert!(!map.doors[0].open, "test door should not start open");
     }
 
     #[test]

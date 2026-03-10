@@ -83,14 +83,33 @@ impl CardinalDir {
     }
 }
 
+/// The three possible states of an interactive door.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DoorState {
+    /// Impassable and cannot be toggled; requires an item (e.g. a key) to unlock.
+    Locked,
+    /// Impassable but can be opened with the **E** key.
+    #[default]
+    Closed,
+    /// Open; the player can walk through.
+    Open,
+}
+
 /// An interactive door entity.  The map tile at its grid position is always
 /// `TileType::Floor`; this entity provides the visual and movement blocking.
-/// Toggle with the E key when adjacent.
+/// Toggle with the E key when adjacent (unless [`DoorState::Locked`]).
 #[derive(Component)]
 pub struct Door {
-    pub open: bool,
+    pub state: DoorState,
     /// Which face of the door sprite is shown (matches asset suffix convention).
     pub facing: CardinalDir,
+}
+
+impl Door {
+    /// Returns `true` only when the door is fully open (player can pass through).
+    pub fn is_passable(&self) -> bool {
+        self.state == DoorState::Open
+    }
 }
 
 /// Every kind of item that can be held in the player's inventory.
