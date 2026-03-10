@@ -71,8 +71,12 @@ const TORCH_RADIUS_VAR: f32 = 60.0;
 const TORCH_INTENSITY: f32 = 3.5;
 /// Peak excursion of the intensity (the "core" flicker, kept subtle).
 const TORCH_INTENSITY_VAR: f32 = 0.25;
-/// Seconds between each auto-travel step (mouse double-click).
-const AUTO_STEP_SECS: f32 = 0.15;
+/// Seconds per tile during auto-travel walk steps (first, last, or short path).
+/// Original suggestion was 0.30 and 0.20 for walk / run.
+const AUTO_WALK_STEP_SECS: f32 = 0.45;
+/// Seconds per tile during auto-travel run steps (middle of a long path).
+/// Faster than walk so running feels like covering ground more quickly.
+const AUTO_RUN_STEP_SECS: f32 = 0.30;
 /// Two clicks within this window count as a double-click.
 const DOUBLE_CLICK_SECS: f32 = 0.3;
 
@@ -220,7 +224,8 @@ struct PlayerAnimation {
     /// determine whether a given step is the first or last of the journey
     /// so the walk→run→walk envelope can be applied correctly.
     path_total: usize,
-    /// Fires every AUTO_STEP_SECS to advance one tile along the path.
+    /// Fires to advance one tile along the path; duration adjusts per step
+    /// between [`AUTO_WALK_STEP_SECS`] and [`AUTO_RUN_STEP_SECS`].
     step_timer: Timer,
 }
 
@@ -238,24 +243,28 @@ impl PlayerAnimation {
             ),
             path: Vec::new(),
             path_total: 0,
-            step_timer: Timer::from_seconds(AUTO_STEP_SECS, TimerMode::Repeating),
+            step_timer: Timer::from_seconds(AUTO_WALK_STEP_SECS, TimerMode::Repeating),
         }
     }
 
-    /// Keyboard step: plays the walk animation.
+    /// Keyboard step or auto-travel walk step: plays the walk animation.
     fn trigger_walk(&mut self, facing: FacingDir) {
         self.facing = facing;
         self.running = true;
         self.auto_running = false;
         self.run_cooldown.reset();
+        self.step_timer
+            .set_duration(std::time::Duration::from_secs_f32(AUTO_WALK_STEP_SECS));
     }
 
-    /// Auto-travel step (mouse double-click): plays the run animation.
+    /// Auto-travel run step (middle of a long path): plays the run animation.
     fn trigger_run(&mut self, facing: FacingDir) {
         self.facing = facing;
         self.running = true;
         self.auto_running = true;
         self.run_cooldown.reset();
+        self.step_timer
+            .set_duration(std::time::Duration::from_secs_f32(AUTO_RUN_STEP_SECS));
     }
 }
 
