@@ -6,6 +6,7 @@ use bevy_light_2d::prelude::*;
 use crate::{
     components::{CharacterKind, ChestContents, Door, DoorState, ItemKind, MainCamera, MapPosition, MapTile, Player, PropTile, StairsMidTile, StairsUpTile, YSort, YSortBias},
     inventory::{Inventory, SelectedSlot, UseItemEvent},
+    log::GameMessage,
     map::{spawn_floor_doors, spawn_floor_tiles, DoorRegistry, Dungeon, Map, TileType},
     ISO_STEP_X, ISO_STEP_Y, TILE_SCALE,
 };
@@ -1100,6 +1101,7 @@ fn interact_with_doors(
     door_registry: Res<DoorRegistry>,
     mut door_q: Query<(&mut Door, &mut Sprite)>,
     asset_server: Res<AssetServer>,
+    mut log: EventWriter<GameMessage>,
 ) {
     if !keyboard.just_pressed(KeyCode::KeyE) {
         return;
@@ -1125,6 +1127,7 @@ fn interact_with_doors(
 
         // Locked doors cannot be toggled with E.
         if door.state == DoorState::Locked {
+            log.send(GameMessage::new("The door is locked. You cannot open it."));
             break;
         }
 

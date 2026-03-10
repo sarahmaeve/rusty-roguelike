@@ -2,6 +2,7 @@ mod camera;
 mod components;
 mod hud;
 mod inventory;
+mod log;
 mod map;
 mod player;
 
@@ -12,6 +13,7 @@ use components::{YSort, YSortBias};
 use camera::CameraPlugin;
 use hud::HudPlugin;
 use inventory::InventoryPlugin;
+use log::GameLogPlugin;
 use map::MapPlugin;
 use player::PlayerPlugin;
 
@@ -49,7 +51,7 @@ fn main() {
                 })
                 .set(ImagePlugin::default_nearest()),
         )
-        .add_plugins((Light2dPlugin, InventoryPlugin, MapPlugin, PlayerPlugin, CameraPlugin, HudPlugin))
+        .add_plugins((Light2dPlugin, InventoryPlugin, GameLogPlugin, MapPlugin, PlayerPlugin, CameraPlugin, HudPlugin))
         .add_systems(Update, y_sort)
         .run();
 }
