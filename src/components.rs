@@ -4,6 +4,14 @@ use bevy::prelude::*;
 #[derive(Component)]
 pub struct Player;
 
+/// Selects which character model and animation set is active for the player.
+#[derive(Component, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CharacterKind {
+    Male,
+    #[default]
+    Female,
+}
+
 /// Marks the main 2D camera entity.
 #[derive(Component)]
 pub struct MainCamera;

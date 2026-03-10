@@ -4,7 +4,7 @@ use bevy::{ecs::system::SystemParam, prelude::*, sprite::Anchor, window::Primary
 use bevy_light_2d::prelude::*;
 
 use crate::{
-    components::{Door, MainCamera, MapPosition, MapTile, Player, StairsMidTile, StairsUpTile, YSort},
+    components::{CharacterKind, Door, MainCamera, MapPosition, MapTile, Player, StairsMidTile, StairsUpTile, YSort},
     map::{spawn_floor_doors, spawn_floor_tiles, DoorRegistry, Dungeon, Map, TileType},
     ISO_STEP_X, ISO_STEP_Y, TILE_SCALE,
 };
@@ -38,6 +38,21 @@ fn wall_cast(map: &Map, origin: Vec2, dir: Vec2, max_dist: f32) -> f32 {
 const RUN_FRAME_COUNT: usize = 10;
 /// Seconds per run animation frame (≈10 fps).
 const RUN_FRAME_SECS: f32 = 0.1;
+
+// ── Female character constants ────────────────────────────────────────────────
+
+/// Number of facing directions in the Female asset pack (every 22.5°).
+const FEMALE_DIR_COUNT: usize = 16;
+/// Frames in each Female walk spritesheet (6 columns × 4 rows).
+const FEMALE_WALK_FRAME_COUNT: usize = 24;
+/// Frames in each Female idle spritesheet (4 columns × 4 rows).
+const FEMALE_IDLE_FRAME_COUNT: usize = 16;
+/// Cell size of each Female spritesheet frame, in pixels.
+const FEMALE_CELL_PX: u32 = 256;
+/// Degree values matching the Female asset filename suffixes.
+const FEMALE_ANGLES: [u32; FEMALE_DIR_COUNT] = [
+    0, 22, 45, 67, 90, 112, 135, 157, 180, 202, 225, 247, 270, 292, 315, 337,
+];
 
 // ── Torch-flicker tunables ────────────────────────────────────────────────────
 
@@ -99,13 +114,64 @@ enum FacingDir {
     NorthWest,
 }
 
+impl FacingDir {
+    /// Returns the index into [`FEMALE_ANGLES`] whose angle is closest to this
+    /// facing direction.
+    ///
+    /// The degree mapping assumes 0° = East in the Female asset pack, increasing
+    /// clockwise.  If the in-game sprites point the wrong way, adjust the values
+    /// in the `match` arm below.
+    fn to_female_dir_index(self) -> usize {
+        let deg: u32 = match self {
+            FacingDir::East      =>   0,
+            FacingDir::SouthEast =>  45,
+            FacingDir::South     =>  90,
+            FacingDir::SouthWest => 135,
+            FacingDir::West      => 180,
+            FacingDir::NorthWest => 225,
+            FacingDir::North     => 270,
+            FacingDir::NorthEast => 315,
+        };
+        FEMALE_ANGLES
+            .iter()
+            .enumerate()
+            .min_by_key(|&(_, &a)| {
+                let diff = (a as i32 - deg as i32).abs();
+                diff.min(360 - diff) as u32
+            })
+            .unwrap()
+            .0
+    }
+}
+
 // ── Animation components ──────────────────────────────────────────────────────
 
-/// Per-direction sprite sets for all 8 facing directions.
+/// Per-direction sprite sets for all 8 facing directions (Male character).
 #[derive(Component)]
 struct PlayerSprites {
     idle: [Handle<Image>; 8],
     run: [[Handle<Image>; RUN_FRAME_COUNT]; 8],
+}
+
+/// Spritesheet handles and atlas layouts for the Female character.
+///
+/// The Female asset pack provides one spritesheet per facing direction for each
+/// animation state, with separate body and shadow layers.  The atlas layout is
+/// shared across all directions since every sheet has the same grid dimensions.
+#[derive(Component)]
+struct FemaleSprites {
+    /// Body layer idle sheets, one per direction (4×4 grid, 256×256 px cells).
+    idle_body:   [Handle<Image>; FEMALE_DIR_COUNT],
+    /// Shadow layer idle sheets, one per direction.
+    idle_shadow: [Handle<Image>; FEMALE_DIR_COUNT],
+    /// Body layer walk sheets, one per direction (6×4 grid, 256×256 px cells).
+    walk_body:   [Handle<Image>; FEMALE_DIR_COUNT],
+    /// Shadow layer walk sheets, one per direction.
+    walk_shadow: [Handle<Image>; FEMALE_DIR_COUNT],
+    /// Shared atlas layout for all idle sheets (4 columns × 4 rows).
+    idle_layout: Handle<TextureAtlasLayout>,
+    /// Shared atlas layout for all walk sheets (6 columns × 4 rows).
+    walk_layout: Handle<TextureAtlasLayout>,
 }
 
 #[derive(Component)]
@@ -192,6 +258,12 @@ struct LanternBeamLight {
     /// Index into `BEAM_SEGMENT_CENTERS` (0 = closest to player).
     segment: usize,
 }
+
+/// Marks the shadow sprite child of the player entity.
+/// For the Female character this is an atlas sprite from the asset pack,
+/// kept in sync with the body sprite each animation frame.
+#[derive(Component)]
+struct PlayerShadow;
 
 // ── Public resources ──────────────────────────────────────────────────────────
 
@@ -282,37 +354,86 @@ fn spawn_player(
     mut commands: Commands,
     dungeon: Res<Dungeon>,
     asset_server: Res<AssetServer>,
+    mut layouts: ResMut<Assets<TextureAtlasLayout>>,
 ) {
-    let sprites = PlayerSprites {
-        idle: std::array::from_fn(|d| {
-            asset_server.load(format!("Characters/Male/Male_{d}_Idle0.png"))
-        }),
-        run: std::array::from_fn(|d| {
-            std::array::from_fn(|i| {
-                asset_server.load(format!("Characters/Male/Male_{d}_Run{i}.png"))
-            })
-        }),
-    };
-    let initial_idle = sprites.idle[FacingDir::South as usize].clone();
-
     let (cx, cy) = dungeon.current_map().rooms[0].center();
     let pos = MapPosition::new(cx, cy);
     let world = pos.to_world(0.0);
 
+    // ── Female atlas layouts ──────────────────────────────────────────────────
+    // Idle sheets: 4 columns × 4 rows, each cell 256×256 px → 16 frames.
+    let idle_layout = layouts.add(TextureAtlasLayout::from_grid(
+        UVec2::splat(FEMALE_CELL_PX),
+        4,
+        4,
+        None,
+        None,
+    ));
+    // Walk sheets: 6 columns × 4 rows, each cell 256×256 px → 24 frames.
+    let walk_layout = layouts.add(TextureAtlasLayout::from_grid(
+        UVec2::splat(FEMALE_CELL_PX),
+        6,
+        4,
+        None,
+        None,
+    ));
+
+    let idle_body: [Handle<Image>; FEMALE_DIR_COUNT] = std::array::from_fn(|i| {
+        asset_server.load(format!(
+            "Characters/Female/IdleUnarmed/Idle_Unarmed_Body_{:03}.png",
+            FEMALE_ANGLES[i]
+        ))
+    });
+    let idle_shadow: [Handle<Image>; FEMALE_DIR_COUNT] = std::array::from_fn(|i| {
+        asset_server.load(format!(
+            "Characters/Female/IdleUnarmed/Idle_Unarmed_Shadow_{:03}.png",
+            FEMALE_ANGLES[i]
+        ))
+    });
+    let walk_body: [Handle<Image>; FEMALE_DIR_COUNT] = std::array::from_fn(|i| {
+        asset_server.load(format!(
+            "Characters/Female/WalkForwardUnarmed/WalkForward_Unarmed_Body_{:03}.png",
+            FEMALE_ANGLES[i]
+        ))
+    });
+    let walk_shadow: [Handle<Image>; FEMALE_DIR_COUNT] = std::array::from_fn(|i| {
+        asset_server.load(format!(
+            "Characters/Female/WalkForwardUnarmed/WalkForward_Unarmed_Shadow_{:03}.png",
+            FEMALE_ANGLES[i]
+        ))
+    });
+
+    let initial_dir = FacingDir::South.to_female_dir_index();
+    let initial_body   = idle_body[initial_dir].clone();
+    let initial_shadow = idle_shadow[initial_dir].clone();
+
+    let female_sprites = FemaleSprites {
+        idle_body,
+        idle_shadow,
+        walk_body,
+        walk_shadow,
+        idle_layout: idle_layout.clone(),
+        walk_layout: walk_layout.clone(),
+    };
+
     commands
         .spawn((
             Player,
+            CharacterKind::Female,
             YSort,
             pos,
-            sprites,
+            female_sprites,
             PlayerAnimation::new(),
             TorchFlicker::default(),
             LightType::default(),
             Sprite {
-                image: initial_idle,
-                // Ground-contact point (feet) at 20% from the bottom of the
-                // sprite image, matching the wall tile anchor convention so the
-                // character stands correctly on the isometric floor plane.
+                image: initial_body,
+                texture_atlas: Some(TextureAtlas {
+                    layout: idle_layout,
+                    index: 0,
+                }),
+                // Ground-contact point at the feet, matching the isometric
+                // tile anchor convention so the character stands on the floor.
                 anchor: Anchor::Custom(Vec2::new(0.0, -0.30)),
                 ..Default::default()
             },
@@ -326,19 +447,25 @@ fn spawn_player(
             },
         ))
         .with_children(|parent| {
+            // Shadow sprite drawn just behind the body (z = -0.001 in local space).
             parent.spawn((
+                PlayerShadow,
                 Sprite {
-                    color: Color::srgba(0.0, 0.0, 0.0, 0.45),
-                    custom_size: Some(Vec2::new(ISO_STEP_X * 0.6, ISO_STEP_Y * 0.3)),
+                    image: initial_shadow,
+                    texture_atlas: Some(TextureAtlas {
+                        layout: walk_layout,
+                        index: 0,
+                    }),
+                    anchor: Anchor::Custom(Vec2::new(0.0, -0.30)),
                     ..Default::default()
                 },
-                Transform::from_xyz(0.0, 0.0, -0.01),
+                Transform::from_xyz(0.0, 0.0, -0.001),
             ));
         });
 
     // Spawn free-standing beam-light entities for the lantern.
     // Inactive (intensity = 0) while the player uses the Torch light type.
-    // `update_lantern` repositions and activates them each frame as needed.
+    // `apply_light_type` repositions and activates them each frame as needed.
     for segment in 0..BEAM_SEGMENTS {
         commands.spawn((
             LanternBeamLight { segment },
@@ -582,13 +709,27 @@ fn auto_step(
 fn animate_player(
     time: Res<Time>,
     mut moving: ResMut<PlayerMoving>,
-    mut query: Query<(&mut Sprite, &mut PlayerAnimation, &PlayerSprites), With<Player>>,
+    mut player_q: Query<
+        (
+            &mut Sprite,
+            &mut PlayerAnimation,
+            &CharacterKind,
+            Option<&PlayerSprites>,
+            Option<&FemaleSprites>,
+            Option<&Children>,
+        ),
+        With<Player>,
+    >,
+    mut shadow_q: Query<&mut Sprite, (With<PlayerShadow>, Without<Player>)>,
 ) {
-    let Ok((mut sprite, mut anim, sprites)) = query.get_single_mut() else {
+    let Ok((mut sprite, mut anim, kind, male_sprites, female_sprites, children)) =
+        player_q.get_single_mut()
+    else {
         moving.0 = false;
         return;
     };
 
+    // Advance run-cooldown and transition to idle when it expires.
     if anim.running {
         anim.run_cooldown.tick(time.delta());
         if anim.run_cooldown.finished() {
@@ -599,16 +740,71 @@ fn animate_player(
 
     moving.0 = anim.running;
 
-    let dir = anim.facing as usize;
+    match kind {
+        CharacterKind::Male => {
+            let Some(sprites) = male_sprites else { return };
+            let dir = anim.facing as usize;
 
-    if anim.running {
-        anim.frame_timer.tick(time.delta());
-        if anim.frame_timer.just_finished() {
-            anim.frame = (anim.frame + 1) % RUN_FRAME_COUNT;
+            if anim.running {
+                anim.frame_timer.tick(time.delta());
+                if anim.frame_timer.just_finished() {
+                    anim.frame = (anim.frame + 1) % RUN_FRAME_COUNT;
+                }
+                sprite.image = sprites.run[dir][anim.frame].clone();
+            } else {
+                sprite.image = sprites.idle[dir].clone();
+            }
         }
-        sprite.image = sprites.run[dir][anim.frame].clone();
-    } else {
-        sprite.image = sprites.idle[dir].clone();
+
+        CharacterKind::Female => {
+            let Some(sprites) = female_sprites else { return };
+            let dir_i = anim.facing.to_female_dir_index();
+
+            // Advance the frame timer for both idle and walk — Female idle is
+            // also an animated loop (16 frames), unlike the Male single frame.
+            anim.frame_timer.tick(time.delta());
+            if anim.frame_timer.just_finished() {
+                let max = if anim.running {
+                    FEMALE_WALK_FRAME_COUNT
+                } else {
+                    FEMALE_IDLE_FRAME_COUNT
+                };
+                anim.frame = (anim.frame + 1) % max;
+            }
+
+            let (body_img, shadow_img, layout) = if anim.running {
+                (
+                    sprites.walk_body[dir_i].clone(),
+                    sprites.walk_shadow[dir_i].clone(),
+                    sprites.walk_layout.clone(),
+                )
+            } else {
+                (
+                    sprites.idle_body[dir_i].clone(),
+                    sprites.idle_shadow[dir_i].clone(),
+                    sprites.idle_layout.clone(),
+                )
+            };
+
+            sprite.image = body_img;
+            if let Some(atlas) = &mut sprite.texture_atlas {
+                atlas.layout = layout.clone();
+                atlas.index = anim.frame;
+            }
+
+            // Keep the shadow child in sync with the body.
+            if let Some(children) = children {
+                for &child in children.iter() {
+                    if let Ok(mut shadow_sprite) = shadow_q.get_mut(child) {
+                        shadow_sprite.image = shadow_img.clone();
+                        if let Some(atlas) = &mut shadow_sprite.texture_atlas {
+                            atlas.layout = layout.clone();
+                            atlas.index = anim.frame;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
