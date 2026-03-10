@@ -216,6 +216,10 @@ struct PlayerAnimation {
     /// Remaining steps for mouse-driven auto-travel.
     /// Stored in *reverse* order so `pop()` yields the next step.
     path: Vec<(i32, i32)>,
+    /// Total length of the path when it was first assigned.  Used to
+    /// determine whether a given step is the first or last of the journey
+    /// so the walk→run→walk envelope can be applied correctly.
+    path_total: usize,
     /// Fires every AUTO_STEP_SECS to advance one tile along the path.
     step_timer: Timer,
 }
@@ -233,6 +237,7 @@ impl PlayerAnimation {
                 TimerMode::Once,
             ),
             path: Vec::new(),
+            path_total: 0,
             step_timer: Timer::from_seconds(AUTO_STEP_SECS, TimerMode::Repeating),
         }
     }
@@ -723,6 +728,7 @@ fn handle_mouse_click(
 
     let closed_doors = doors.closed_positions();
     if let Some(path) = bfs_path(map, &closed_doors, (pos.x, pos.y), (target_x, target_y)) {
+        anim.path_total = path.len();
         anim.path = path;
         anim.step_timer.reset();
     }
@@ -763,7 +769,22 @@ fn auto_step(
     let world = pos.to_world(0.0);
     transform.translation.x = world.x;
     transform.translation.y = world.y;
-    anim.trigger_run(facing);
+
+    // Walk→run→walk envelope: use the run animation only for the middle
+    // tiles of a path that is long enough to have a distinct run phase.
+    // With path_total <= 2 the whole journey uses the walk animation.
+    // With path_total >= 3 the first and last tiles walk; the rest run.
+    let remaining = anim.path.len(); // steps still to go after this one
+    let step_index = anim.path_total.saturating_sub(remaining + 1);
+    let is_first = step_index == 0;
+    let is_last  = remaining == 0;
+    let use_run  = anim.path_total >= 3 && !is_first && !is_last;
+
+    if use_run {
+        anim.trigger_run(facing);
+    } else {
+        anim.trigger_walk(facing);
+    }
 }
 
 // ── Update system: drive the sprite animation ─────────────────────────────────
