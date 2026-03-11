@@ -1637,6 +1637,54 @@ fn cull_map_tiles(
     }
 }
 
+// ── Tile hover highlight ──────────────────────────────────────────────────────
+
+/// Colour for a walkable tile outline (green, semi-transparent).
+const HIGHLIGHT_WALKABLE: Color = Color::srgba(0.0, 0.85, 0.0, 0.7);
+/// Colour for a non-walkable tile outline (red, semi-transparent).
+const HIGHLIGHT_BLOCKED: Color = Color::srgba(0.85, 0.0, 0.0, 0.7);
+
+/// Draws a thin isometric diamond outline around the tile under the cursor.
+fn draw_tile_highlight(
+    cursor: WorldCursor<'_, '_>,
+    dungeon: Res<Dungeon>,
+    doors: DoorParams<'_, '_>,
+    mut gizmos: Gizmos,
+) {
+    let Some(world_pos) = cursor.world_pos() else { return };
+
+    // Convert cursor world position to grid coordinates.
+    let sum  = -world_pos.y / ISO_STEP_Y;
+    let diff =  world_pos.x / ISO_STEP_X;
+    let gx = ((diff + sum) / 2.0).round() as i32;
+    let gy = ((sum  - diff) / 2.0).round() as i32;
+
+    let map = dungeon.current_map();
+
+    // Choose colour based on walkability.
+    let passable = map.is_passable(gx, gy) && !doors.is_closed_at((gx, gy));
+    let color = if passable { HIGHLIGHT_WALKABLE } else { HIGHLIGHT_BLOCKED };
+
+    // Tile-centre in world space.
+    let cx = (gx as f32 - gy as f32) * ISO_STEP_X;
+    let cy = -(gx as f32 + gy as f32) * ISO_STEP_Y;
+
+    // Four vertices of the isometric diamond.
+    let top    = Vec2::new(cx,              cy + ISO_STEP_Y);
+    let right  = Vec2::new(cx + ISO_STEP_X, cy);
+    let bottom = Vec2::new(cx,              cy - ISO_STEP_Y);
+    let left   = Vec2::new(cx - ISO_STEP_X, cy);
+
+    // Draw the diamond at a high Z so it renders on top of floor tiles.
+    let z = 100.0;
+    let to3 = |v: Vec2| Vec3::new(v.x, v.y, z);
+
+    gizmos.line(to3(top),    to3(right),  color);
+    gizmos.line(to3(right),  to3(bottom), color);
+    gizmos.line(to3(bottom), to3(left),   color);
+    gizmos.line(to3(left),   to3(top),    color);
+}
+
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
 pub struct PlayerPlugin;
@@ -1667,6 +1715,7 @@ impl Plugin for PlayerPlugin {
                     flicker_torch.after(toggle_light_type),
                     apply_light_type.after(toggle_light_type),
                     cull_map_tiles.after(apply_light_type),
+                    draw_tile_highlight,
                 ),
             );
     }
