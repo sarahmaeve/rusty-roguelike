@@ -38,8 +38,12 @@ fn wall_cast(map: &Map, origin: Vec2, dir: Vec2, max_dist: f32) -> f32 {
 }
 
 const RUN_FRAME_COUNT: usize = 10;
-/// Seconds per run animation frame (≈10 fps).
+/// Seconds per run animation frame (≈10 fps).  Used for Male and as fallback.
 const RUN_FRAME_SECS: f32 = 0.1;
+/// Seconds per animation frame during female auto-travel walk (slower pace).
+const FEMALE_AUTO_WALK_FRAME_SECS: f32 = 0.08;
+/// Seconds per animation frame during female auto-travel run (faster pace).
+const FEMALE_AUTO_RUN_FRAME_SECS: f32 = 0.055;
 
 // ── Female character constants ────────────────────────────────────────────────
 
@@ -265,6 +269,14 @@ struct PlayerAnimation {
     /// between [`AUTO_WALK_STEP_SECS`] and [`AUTO_RUN_STEP_SECS`].
     step_timer: Timer,
 
+    // ── Auto-travel interpolation ─────────────────────────────────────────────
+    /// World-space position at the start of the current interpolated step.
+    lerp_from: Vec3,
+    /// World-space position at the end of the current interpolated step.
+    lerp_to: Vec3,
+    /// True while an auto-travel step is being interpolated between tiles.
+    lerping: bool,
+
     // ── Jump state ────────────────────────────────────────────────────────────
     /// True while any jump phase is in progress.  Blocks all other movement.
     jumping: bool,
@@ -301,6 +313,9 @@ impl PlayerAnimation {
             path: Vec::new(),
             path_total: 0,
             step_timer: Timer::from_seconds(AUTO_WALK_STEP_SECS, TimerMode::Repeating),
+            lerp_from: Vec3::ZERO,
+            lerp_to: Vec3::ZERO,
+            lerping: false,
             jumping: false,
             jump_phase: JumpPhase::default(),
             jump_target: (0, 0),
@@ -330,6 +345,7 @@ impl PlayerAnimation {
         // Clear motion state so idle resumes after landing.
         self.running = false;
         self.path.clear();
+        self.lerping = false;
     }
 
     /// Transition from the current jump phase to the next, resetting frame
@@ -359,20 +375,38 @@ impl PlayerAnimation {
 
     /// Keyboard step or auto-travel walk step: plays the walk animation.
     fn trigger_walk(&mut self, facing: FacingDir) {
+        // Reset frame counter when switching from run to walk to avoid
+        // an out-of-range atlas index (run has fewer frames than walk).
+        if self.auto_running {
+            self.frame = 0;
+        }
         self.facing = facing;
         self.running = true;
         self.auto_running = false;
+        self.run_cooldown
+            .set_duration(std::time::Duration::from_secs_f32(AUTO_WALK_STEP_SECS));
         self.run_cooldown.reset();
+        self.frame_timer
+            .set_duration(std::time::Duration::from_secs_f32(FEMALE_AUTO_WALK_FRAME_SECS));
         self.step_timer
             .set_duration(std::time::Duration::from_secs_f32(AUTO_WALK_STEP_SECS));
     }
 
     /// Auto-travel run step (middle of a long path): plays the run animation.
     fn trigger_run(&mut self, facing: FacingDir) {
+        // Reset frame counter when switching from walk to run to avoid
+        // starting mid-cycle with a walk-length frame index.
+        if !self.auto_running {
+            self.frame = 0;
+        }
         self.facing = facing;
         self.running = true;
         self.auto_running = true;
+        self.run_cooldown
+            .set_duration(std::time::Duration::from_secs_f32(AUTO_RUN_STEP_SECS));
         self.run_cooldown.reset();
+        self.frame_timer
+            .set_duration(std::time::Duration::from_secs_f32(FEMALE_AUTO_RUN_FRAME_SECS));
         self.step_timer
             .set_duration(std::time::Duration::from_secs_f32(AUTO_RUN_STEP_SECS));
     }
@@ -944,9 +978,25 @@ fn auto_step(
         return;
     }
 
+    // While a lerp is in progress, interpolate position each frame.
+    if anim.lerping {
+        let step_dur = anim.step_timer.duration().as_secs_f32();
+        let elapsed  = anim.step_timer.elapsed_secs();
+        let t = (elapsed / step_dur).clamp(0.0, 1.0);
+        transform.translation.x = anim.lerp_from.x + (anim.lerp_to.x - anim.lerp_from.x) * t;
+        transform.translation.y = anim.lerp_from.y + (anim.lerp_to.y - anim.lerp_from.y) * t;
+    }
+
     anim.step_timer.tick(time.delta());
     if !anim.step_timer.just_finished() {
         return;
+    }
+
+    // Finish the previous lerp by snapping to the exact destination.
+    if anim.lerping {
+        transform.translation.x = anim.lerp_to.x;
+        transform.translation.y = anim.lerp_to.y;
+        anim.lerping = false;
     }
 
     let Some((nx, ny)) = anim.path.pop() else { return; };
@@ -960,12 +1010,6 @@ fn auto_step(
 
     let facing = dir_to_facing(nx - pos.x, ny - pos.y);
 
-    pos.x = nx;
-    pos.y = ny;
-    let world = pos.to_world(0.0);
-    transform.translation.x = world.x;
-    transform.translation.y = world.y;
-
     // Walk→run→walk envelope: use the run animation only for the middle
     // tiles of a path that is long enough to have a distinct run phase.
     // With path_total <= 2 the whole journey uses the walk animation.
@@ -975,6 +1019,16 @@ fn auto_step(
     let is_first = step_index == 0;
     let is_last  = remaining == 0;
     let use_run  = anim.path_total >= 3 && !is_first && !is_last;
+
+    // Set up smooth interpolation from current position to next tile.
+    anim.lerp_from = Vec3::new(transform.translation.x, transform.translation.y, 0.0);
+    let next_pos = MapPosition::new(nx, ny);
+    anim.lerp_to = next_pos.to_world(0.0);
+    anim.lerping = true;
+
+    // Update MapPosition immediately so game logic tracks the new tile.
+    pos.x = nx;
+    pos.y = ny;
 
     if use_run {
         anim.trigger_run(facing);
@@ -2207,5 +2261,53 @@ mod tests {
     fn dir_to_facing_zero_delta_is_south() {
         // dir_to_facing(0,0) falls through to the default arm (South).
         assert_eq!(dir_to_facing(0, 0) as usize, FacingDir::South as usize);
+    }
+
+    #[test]
+    fn trigger_walk_resets_frame_on_run_to_walk_transition() {
+        let mut anim = PlayerAnimation::new();
+        // Simulate being in run state with a frame beyond walk count.
+        anim.running = true;
+        anim.auto_running = true;
+        anim.frame = FEMALE_RUN_FRAME_COUNT - 1;
+        anim.trigger_walk(FacingDir::North);
+        assert_eq!(anim.frame, 0, "frame must reset when switching from run to walk");
+        assert!(!anim.auto_running);
+    }
+
+    #[test]
+    fn trigger_run_resets_frame_on_walk_to_run_transition() {
+        let mut anim = PlayerAnimation::new();
+        anim.running = true;
+        anim.auto_running = false;
+        anim.frame = FEMALE_WALK_FRAME_COUNT - 1;
+        anim.trigger_run(FacingDir::East);
+        assert_eq!(anim.frame, 0, "frame must reset when switching from walk to run");
+        assert!(anim.auto_running);
+    }
+
+    #[test]
+    fn trigger_walk_preserves_frame_when_already_walking() {
+        let mut anim = PlayerAnimation::new();
+        anim.running = true;
+        anim.auto_running = false;
+        anim.frame = 10;
+        anim.trigger_walk(FacingDir::South);
+        assert_eq!(anim.frame, 10, "frame should be preserved when walk-to-walk");
+    }
+
+    #[test]
+    fn run_cooldown_matches_step_duration() {
+        let mut anim = PlayerAnimation::new();
+        anim.trigger_walk(FacingDir::North);
+        assert!(
+            (anim.run_cooldown.duration().as_secs_f32() - AUTO_WALK_STEP_SECS).abs() < 1e-5,
+            "walk cooldown should match walk step duration"
+        );
+        anim.trigger_run(FacingDir::North);
+        assert!(
+            (anim.run_cooldown.duration().as_secs_f32() - AUTO_RUN_STEP_SECS).abs() < 1e-5,
+            "run cooldown should match run step duration"
+        );
     }
 }
