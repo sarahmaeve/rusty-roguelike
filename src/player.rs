@@ -817,11 +817,25 @@ fn handle_mouse_click(
         selected_slot.0 = None;
     }
 
+    let Ok((pos, mut anim)) = player_q.get_single_mut() else { return; };
+
+    // Don't process clicks while jumping or auto-travelling.
+    if anim.jumping || !anim.path.is_empty() {
+        return;
+    }
+
     let now = time.elapsed_secs();
     let is_double = (now - click_state.last_click_time) < DOUBLE_CLICK_SECS;
     click_state.last_click_time = now;
 
+    let dx = target_x - pos.x;
+    let dy = target_y - pos.y;
+
     if !is_double {
+        // Single click: turn the player to face the clicked tile.
+        if dx != 0 || dy != 0 {
+            anim.facing = dir_to_facing(dx, dy);
+        }
         return;
     }
 
@@ -829,8 +843,6 @@ fn handle_mouse_click(
     if !map.is_passable(target_x, target_y) {
         return;
     }
-
-    let Ok((pos, mut anim)) = player_q.get_single_mut() else { return; };
 
     let closed_doors = doors.closed_positions();
     if let Some(path) = bfs_path(map, &closed_doors, (pos.x, pos.y), (target_x, target_y)) {
@@ -1943,5 +1955,25 @@ mod tests {
         assert_eq!(anim.jump_frame, 0);
         assert!(anim.path.is_empty(), "trigger_jump must clear auto-travel path");
         assert!(!anim.running, "trigger_jump must clear running state");
+    }
+
+    /// Single-click facing uses `dir_to_facing` with the grid delta from the
+    /// player to the clicked tile.  Large deltas must resolve the same way as
+    /// unit deltas (signum collapses the magnitude).
+    #[test]
+    fn dir_to_facing_large_deltas() {
+        // Clicking far to the south-east (dx=+5, dy=+3) should face SouthEast.
+        assert_eq!(dir_to_facing(5, 3) as usize, FacingDir::SouthEast as usize);
+        // Pure cardinal at distance: dx=0, dy=-10 → North.
+        assert_eq!(dir_to_facing(0, -10) as usize, FacingDir::North as usize);
+        // Diagonal at distance: dx=-7, dy=-7 → NorthWest.
+        assert_eq!(dir_to_facing(-7, -7) as usize, FacingDir::NorthWest as usize);
+    }
+
+    /// Clicking the player's own tile (dx=0, dy=0) must not change facing.
+    #[test]
+    fn dir_to_facing_zero_delta_is_south() {
+        // dir_to_facing(0,0) falls through to the default arm (South).
+        assert_eq!(dir_to_facing(0, 0) as usize, FacingDir::South as usize);
     }
 }
