@@ -974,30 +974,38 @@ fn auto_step(
 ) {
     let Ok((mut pos, mut transform, mut anim)) = query.get_single_mut() else { return; };
 
-    if anim.jumping || anim.path.is_empty() {
+    if anim.jumping {
         return;
     }
 
-    // While a lerp is in progress, interpolate position each frame.
+    // If a lerp is active, interpolate and wait for the step timer.
+    // This must run even when the path is empty — the last tile pop
+    // empties the path but its lerp still needs to complete.
     if anim.lerping {
         let step_dur = anim.step_timer.duration().as_secs_f32();
         let elapsed  = anim.step_timer.elapsed_secs();
         let t = (elapsed / step_dur).clamp(0.0, 1.0);
         transform.translation.x = anim.lerp_from.x + (anim.lerp_to.x - anim.lerp_from.x) * t;
         transform.translation.y = anim.lerp_from.y + (anim.lerp_to.y - anim.lerp_from.y) * t;
-    }
 
-    anim.step_timer.tick(time.delta());
-    if !anim.step_timer.just_finished() {
-        return;
-    }
+        anim.step_timer.tick(time.delta());
+        if !anim.step_timer.just_finished() {
+            return;
+        }
 
-    // Finish the previous lerp by snapping to the exact destination.
-    if anim.lerping {
+        // Snap to the exact destination.
         transform.translation.x = anim.lerp_to.x;
         transform.translation.y = anim.lerp_to.y;
         anim.lerping = false;
     }
+
+    if anim.path.is_empty() {
+        return;
+    }
+
+    // When lerping is false and the path is non-empty we either just
+    // finished a step or the path was freshly assigned — pop the next
+    // tile immediately so the first step starts without a timer delay.
 
     let Some((nx, ny)) = anim.path.pop() else { return; };
 
@@ -1025,6 +1033,7 @@ fn auto_step(
     let next_pos = MapPosition::new(nx, ny);
     anim.lerp_to = next_pos.to_world(0.0);
     anim.lerping = true;
+    anim.step_timer.reset();
 
     // Update MapPosition immediately so game logic tracks the new tile.
     pos.x = nx;
@@ -1063,7 +1072,9 @@ fn animate_player(
     };
 
     // Advance run-cooldown and transition to idle when it expires.
-    if anim.running {
+    // Skip the cooldown while auto-travel steps remain — the next auto_step
+    // call will reset it, and expiring here would flash Idle for one frame.
+    if anim.running && anim.path.is_empty() {
         anim.run_cooldown.tick(time.delta());
         if anim.run_cooldown.finished() {
             anim.running = false;
@@ -1913,8 +1924,8 @@ impl Plugin for PlayerPlugin {
                     player_movement,
                     handle_mouse_click,
                     trigger_jump_system.after(player_movement),
-                    auto_step.after(player_movement),
-                    animate_player.after(trigger_jump_system),
+                    auto_step.after(player_movement).after(handle_mouse_click),
+                    animate_player.after(trigger_jump_system).after(auto_step),
                     apply_jump_arc.after(animate_player),
                     on_jump_land.after(apply_jump_arc),
                     interact_with_stairs,
