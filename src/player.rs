@@ -47,6 +47,8 @@ const RUN_FRAME_SECS: f32 = 0.1;
 const FEMALE_DIR_COUNT: usize = 16;
 /// Frames in each Female walk spritesheet (6 columns × 4 rows).
 const FEMALE_WALK_FRAME_COUNT: usize = 24;
+/// Frames in each Female walk-back spritesheet (6 columns × 4 rows, same grid).
+const FEMALE_WALKBACK_FRAME_COUNT: usize = 24;
 /// Frames in each Female run spritesheet (5 columns × 4 rows).
 const FEMALE_RUN_FRAME_COUNT: usize = 20;
 /// Frames in each Female idle spritesheet (4 columns × 4 rows).
@@ -54,9 +56,13 @@ const FEMALE_IDLE_FRAME_COUNT: usize = 16;
 /// Frames in each Female jump spritesheet (6 columns × 4 rows, same grid as walk).
 const FEMALE_JUMP_FRAME_COUNT: usize = 24;
 /// Seconds per jump animation frame (≈25 fps).  The full arc plays in ~0.96 s.
-const FEMALE_JUMP_FRAME_SECS: f32 = 0.04;
+const FEMALE_JUMP_FRAME_SECS: f32 = 0.06;
+/// Seconds per frame during the walk-back phase of a jump.
+const JUMP_WALKBACK_FRAME_SECS: f32 = 0.04;
+/// Seconds per frame during the run-forward phase of a jump.
+const JUMP_RUNFWD_FRAME_SECS: f32 = 0.035;
 /// Peak height of the jump arc in world units (screen-space pixels at TILE_SCALE).
-const JUMP_ARC_HEIGHT: f32 = 60.0;
+const JUMP_ARC_HEIGHT: f32 = 30.0;
 /// Cell size of each Female spritesheet frame, in pixels.
 const FEMALE_CELL_PX: u32 = 256;
 /// Sprite anchor for the Female character.
@@ -200,6 +206,10 @@ struct FemaleSprites {
     walk_body:   [Handle<Image>; FEMALE_DIR_COUNT],
     /// Shadow layer walk sheets, one per direction.
     walk_shadow: [Handle<Image>; FEMALE_DIR_COUNT],
+    /// Body layer walk-back sheets, one per direction (6×4 grid, 256×256 px cells).
+    walkback_body:   [Handle<Image>; FEMALE_DIR_COUNT],
+    /// Shadow layer walk-back sheets, one per direction.
+    walkback_shadow: [Handle<Image>; FEMALE_DIR_COUNT],
     /// Body layer run sheets, one per direction (5×4 grid, 256×256 px cells).
     run_body:    [Handle<Image>; FEMALE_DIR_COUNT],
     /// Shadow layer run sheets, one per direction.
@@ -216,6 +226,19 @@ struct FemaleSprites {
     run_layout:  Handle<TextureAtlasLayout>,
     /// Shared atlas layout for all jump sheets (6 columns × 4 rows, same as walk).
     jump_layout: Handle<TextureAtlasLayout>,
+}
+
+/// The three phases of a jump sequence: walk-back, run-forward, arc.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum JumpPhase {
+    /// Walk backwards one tile (using WalkBack_Unarmed sprites).
+    /// Facing direction is preserved.
+    #[default]
+    WalkBack,
+    /// Run forward one tile back to the origin (using Run sprites).
+    RunForward,
+    /// Parabolic jump arc over two tiles (using Jump sprites).
+    Arc,
 }
 
 #[derive(Component)]
@@ -243,17 +266,23 @@ struct PlayerAnimation {
     step_timer: Timer,
 
     // ── Jump state ────────────────────────────────────────────────────────────
-    /// True while a jump arc is in progress.  Blocks all other movement input.
+    /// True while any jump phase is in progress.  Blocks all other movement.
     jumping: bool,
-    /// The grid tile the jump will land on.
+    /// Current phase of the three-phase jump sequence.
+    jump_phase: JumpPhase,
+    /// The grid tile the jump will land on (two tiles ahead of origin).
     jump_target: (i32, i32),
+    /// The tile the player started the jump on (before walking back).
+    jump_origin: (i32, i32),
+    /// The tile one step behind the origin (walk-back destination).
+    jump_back_tile: (i32, i32),
     /// Set to `true` once [`MapPosition`] has been updated to `jump_target`
     /// (happens at the arc midpoint so the player snaps onto the landing tile
     /// at the peak of the jump rather than at touchdown).
     jump_midpoint_reached: bool,
-    /// Current frame index in the jump spritesheet (0 … [`FEMALE_JUMP_FRAME_COUNT`]-1).
+    /// Current frame index in the active jump-phase spritesheet.
     jump_frame: usize,
-    /// Per-frame timer for the jump animation.
+    /// Per-frame timer for the active jump-phase animation.
     jump_frame_timer: Timer,
 }
 
@@ -273,24 +302,59 @@ impl PlayerAnimation {
             path_total: 0,
             step_timer: Timer::from_seconds(AUTO_WALK_STEP_SECS, TimerMode::Repeating),
             jumping: false,
+            jump_phase: JumpPhase::default(),
             jump_target: (0, 0),
+            jump_origin: (0, 0),
+            jump_back_tile: (0, 0),
             jump_midpoint_reached: false,
             jump_frame: 0,
-            jump_frame_timer: Timer::from_seconds(FEMALE_JUMP_FRAME_SECS, TimerMode::Repeating),
+            jump_frame_timer: Timer::from_seconds(JUMP_WALKBACK_FRAME_SECS, TimerMode::Repeating),
         }
     }
 
-    /// Begin a jump arc towards `target` (two tiles ahead in the facing direction).
-    /// Cancels any active auto-travel path and clears the running state.
-    fn trigger_jump(&mut self, target: (i32, i32)) {
+    /// Begin the three-phase jump sequence.
+    ///
+    /// `origin` is the player's starting tile, `back_tile` is one tile behind
+    /// (walk-back destination), and `target` is two tiles ahead (landing tile).
+    fn trigger_jump(&mut self, origin: (i32, i32), back_tile: (i32, i32), target: (i32, i32)) {
         self.jumping = true;
+        self.jump_phase = JumpPhase::WalkBack;
+        self.jump_origin = origin;
+        self.jump_back_tile = back_tile;
         self.jump_target = target;
         self.jump_midpoint_reached = false;
         self.jump_frame = 0;
+        self.jump_frame_timer
+            .set_duration(std::time::Duration::from_secs_f32(JUMP_WALKBACK_FRAME_SECS));
         self.jump_frame_timer.reset();
         // Clear motion state so idle resumes after landing.
         self.running = false;
         self.path.clear();
+    }
+
+    /// Transition from the current jump phase to the next, resetting frame
+    /// counters and adjusting the per-frame timer duration.  Returns `true`
+    /// if the jump sequence is complete (Arc phase finished).
+    fn advance_jump_phase(&mut self) -> bool {
+        match self.jump_phase {
+            JumpPhase::WalkBack => {
+                self.jump_phase = JumpPhase::RunForward;
+                self.jump_frame = 0;
+                self.jump_frame_timer
+                    .set_duration(std::time::Duration::from_secs_f32(JUMP_RUNFWD_FRAME_SECS));
+                self.jump_frame_timer.reset();
+                false
+            }
+            JumpPhase::RunForward => {
+                self.jump_phase = JumpPhase::Arc;
+                self.jump_frame = 0;
+                self.jump_frame_timer
+                    .set_duration(std::time::Duration::from_secs_f32(FEMALE_JUMP_FRAME_SECS));
+                self.jump_frame_timer.reset();
+                false
+            }
+            JumpPhase::Arc => true,
+        }
     }
 
     /// Keyboard step or auto-travel walk step: plays the walk animation.
@@ -510,6 +574,18 @@ fn spawn_player(
             FEMALE_ANGLES[i]
         ))
     });
+    let walkback_body: [Handle<Image>; FEMALE_DIR_COUNT] = std::array::from_fn(|i| {
+        asset_server.load(format!(
+            "Characters/Female/WalkBack_Unarmed/WalkBack_Unarmed_Body_{:03}.png",
+            FEMALE_ANGLES[i]
+        ))
+    });
+    let walkback_shadow: [Handle<Image>; FEMALE_DIR_COUNT] = std::array::from_fn(|i| {
+        asset_server.load(format!(
+            "Characters/Female/WalkBack_Unarmed/WalkBack_Unarmed_Shadow_{:03}.png",
+            FEMALE_ANGLES[i]
+        ))
+    });
     let run_body: [Handle<Image>; FEMALE_DIR_COUNT] = std::array::from_fn(|i| {
         asset_server.load(format!(
             "Characters/Female/RunUnarmed/Run_Unarmed_Body_{:03}.png",
@@ -546,6 +622,8 @@ fn spawn_player(
         idle_shadow,
         walk_body,
         walk_shadow,
+        walkback_body,
+        walkback_shadow,
         run_body,
         run_shadow,
         jump_body,
@@ -964,20 +1042,46 @@ fn animate_player(
             // ── Jump animation (takes priority) ───────────────────────────────
             if anim.jumping {
                 anim.jump_frame_timer.tick(time.delta());
+
+                // Determine frame count for the current phase.
+                let phase_frame_count = match anim.jump_phase {
+                    JumpPhase::WalkBack   => FEMALE_WALKBACK_FRAME_COUNT,
+                    JumpPhase::RunForward => FEMALE_RUN_FRAME_COUNT,
+                    JumpPhase::Arc        => FEMALE_JUMP_FRAME_COUNT,
+                };
+
                 if anim.jump_frame_timer.just_finished() {
-                    if anim.jump_frame + 1 >= FEMALE_JUMP_FRAME_COUNT {
-                        // Arc complete — let resolve_jump handle the landing.
-                        anim.jumping = false;
-                        anim.jump_frame = FEMALE_JUMP_FRAME_COUNT - 1;
-                        jump_land_events.send(JumpLandedEvent);
+                    if anim.jump_frame + 1 >= phase_frame_count {
+                        // Current phase complete — advance to the next one.
+                        let finished = anim.advance_jump_phase();
+                        if finished {
+                            anim.jumping = false;
+                            anim.jump_frame = FEMALE_JUMP_FRAME_COUNT - 1;
+                            jump_land_events.send(JumpLandedEvent);
+                        }
                     } else {
                         anim.jump_frame += 1;
                     }
                 }
 
-                let body_img   = sprites.jump_body[dir_i].clone();
-                let shadow_img = sprites.jump_shadow[dir_i].clone();
-                let layout     = sprites.jump_layout.clone();
+                // Select spritesheet and layout for the current phase.
+                let (body_img, shadow_img, layout) = match anim.jump_phase {
+                    JumpPhase::WalkBack => (
+                        sprites.walkback_body[dir_i].clone(),
+                        sprites.walkback_shadow[dir_i].clone(),
+                        sprites.walk_layout.clone(), // same 6×4 grid
+                    ),
+                    JumpPhase::RunForward => (
+                        sprites.run_body[dir_i].clone(),
+                        sprites.run_shadow[dir_i].clone(),
+                        sprites.run_layout.clone(),
+                    ),
+                    JumpPhase::Arc => (
+                        sprites.jump_body[dir_i].clone(),
+                        sprites.jump_shadow[dir_i].clone(),
+                        sprites.jump_layout.clone(),
+                    ),
+                };
 
                 sprite.image = body_img;
                 if let Some(atlas) = &mut sprite.texture_atlas {
@@ -1459,17 +1563,29 @@ fn trigger_jump_system(
         return;
     }
 
-    anim.trigger_jump((land_x, land_y));
+    // The player walks back one tile before running up and jumping.
+    let back_x = pos.x - dx;
+    let back_y = pos.y - dy;
+    if !map.in_bounds(back_x, back_y)
+        || !map.is_passable(back_x, back_y)
+        || doors.is_closed_at((back_x, back_y))
+    {
+        log.send(GameMessage::alert("Not enough room to jump."));
+        return;
+    }
+
+    anim.trigger_jump((pos.x, pos.y), (back_x, back_y), (land_x, land_y));
 }
 
 // ── Update system: apply jump arc to Transform ────────────────────────────────
 
-/// Applies the parabolic jump arc to the player's world transform each frame.
+/// Applies per-phase transform interpolation for the three-phase jump.
+///
+/// - **WalkBack**: linearly interpolates from `jump_origin` to `jump_back_tile`.
+/// - **RunForward**: linearly interpolates from `jump_back_tile` to `jump_origin`.
+/// - **Arc**: parabolic arc from `jump_origin` to `jump_target` (two tiles ahead).
 ///
 /// Runs after [`animate_player`] so `jump_frame` is already updated.
-/// At the arc midpoint (frame ≥ half of total) the [`MapPosition`] is snapped
-/// to the landing tile so the player's depth-sort and light position track the
-/// correct destination during the descent.
 fn apply_jump_arc(
     mut player_q: Query<(&mut MapPosition, &mut Transform, &mut PlayerAnimation), With<Player>>,
 ) {
@@ -1479,21 +1595,62 @@ fn apply_jump_arc(
         return;
     }
 
-    // Snap MapPosition to the landing tile at the arc midpoint.
-    if !anim.jump_midpoint_reached
-        && anim.jump_frame >= FEMALE_JUMP_FRAME_COUNT / 2
-    {
-        anim.jump_midpoint_reached = true;
-        let (tx, ty) = anim.jump_target;
-        pos.x = tx;
-        pos.y = ty;
-    }
+    let origin_world = MapPosition::new(anim.jump_origin.0, anim.jump_origin.1).to_world(0.0);
+    let back_world   = MapPosition::new(anim.jump_back_tile.0, anim.jump_back_tile.1).to_world(0.0);
+    let target_world = MapPosition::new(anim.jump_target.0, anim.jump_target.1).to_world(0.0);
 
-    let base = pos.to_world(0.0);
-    let t = anim.jump_frame as f32 / (FEMALE_JUMP_FRAME_COUNT - 1) as f32;
-    let arc = JUMP_ARC_HEIGHT * 4.0 * t * (1.0 - t);
-    transform.translation.x = base.x;
-    transform.translation.y = base.y + arc;
+    match anim.jump_phase {
+        JumpPhase::WalkBack => {
+            let max_frame = (FEMALE_WALKBACK_FRAME_COUNT - 1).max(1) as f32;
+            let t = anim.jump_frame as f32 / max_frame;
+            let wx = origin_world.x + (back_world.x - origin_world.x) * t;
+            let wy = origin_world.y + (back_world.y - origin_world.y) * t;
+            transform.translation.x = wx;
+            transform.translation.y = wy;
+
+            // Snap MapPosition to back tile at the end of the walk-back.
+            if anim.jump_frame >= FEMALE_WALKBACK_FRAME_COUNT / 2 {
+                pos.x = anim.jump_back_tile.0;
+                pos.y = anim.jump_back_tile.1;
+            }
+        }
+
+        JumpPhase::RunForward => {
+            let max_frame = (FEMALE_RUN_FRAME_COUNT - 1).max(1) as f32;
+            let t = anim.jump_frame as f32 / max_frame;
+            let wx = back_world.x + (origin_world.x - back_world.x) * t;
+            let wy = back_world.y + (origin_world.y - back_world.y) * t;
+            transform.translation.x = wx;
+            transform.translation.y = wy;
+
+            // Snap MapPosition to origin at the end of the run-forward.
+            if anim.jump_frame >= FEMALE_RUN_FRAME_COUNT / 2 {
+                pos.x = anim.jump_origin.0;
+                pos.y = anim.jump_origin.1;
+            }
+        }
+
+        JumpPhase::Arc => {
+            // Snap MapPosition to the landing tile at the arc midpoint.
+            if !anim.jump_midpoint_reached
+                && anim.jump_frame >= FEMALE_JUMP_FRAME_COUNT / 2
+            {
+                anim.jump_midpoint_reached = true;
+                pos.x = anim.jump_target.0;
+                pos.y = anim.jump_target.1;
+            }
+
+            let max_frame = (FEMALE_JUMP_FRAME_COUNT - 1).max(1) as f32;
+            let t = anim.jump_frame as f32 / max_frame;
+            // Linear horizontal/vertical interpolation from origin to target.
+            let wx = origin_world.x + (target_world.x - origin_world.x) * t;
+            let wy = origin_world.y + (target_world.y - origin_world.y) * t;
+            // Parabolic vertical arc on top.
+            let arc = JUMP_ARC_HEIGHT * 4.0 * t * (1.0 - t);
+            transform.translation.x = wx;
+            transform.translation.y = wy + arc;
+        }
+    }
 }
 
 // ── Update system: handle jump landing ───────────────────────────────────────
@@ -1997,13 +2154,39 @@ mod tests {
     #[test]
     fn trigger_jump_sets_jumping_state() {
         let mut anim = PlayerAnimation::new();
-        anim.trigger_jump((5, 7));
+        anim.trigger_jump((3, 4), (2, 4), (5, 4));
         assert!(anim.jumping);
-        assert_eq!(anim.jump_target, (5, 7));
+        assert_eq!(anim.jump_phase, JumpPhase::WalkBack);
+        assert_eq!(anim.jump_origin, (3, 4));
+        assert_eq!(anim.jump_back_tile, (2, 4));
+        assert_eq!(anim.jump_target, (5, 4));
         assert!(!anim.jump_midpoint_reached);
         assert_eq!(anim.jump_frame, 0);
         assert!(anim.path.is_empty(), "trigger_jump must clear auto-travel path");
         assert!(!anim.running, "trigger_jump must clear running state");
+    }
+
+    #[test]
+    fn advance_jump_phase_cycles_correctly() {
+        let mut anim = PlayerAnimation::new();
+        anim.trigger_jump((3, 4), (2, 4), (5, 4));
+        assert_eq!(anim.jump_phase, JumpPhase::WalkBack);
+
+        assert!(!anim.advance_jump_phase());
+        assert_eq!(anim.jump_phase, JumpPhase::RunForward);
+        assert_eq!(anim.jump_frame, 0);
+
+        assert!(!anim.advance_jump_phase());
+        assert_eq!(anim.jump_phase, JumpPhase::Arc);
+        assert_eq!(anim.jump_frame, 0);
+
+        assert!(anim.advance_jump_phase(), "Arc should signal completion");
+    }
+
+    #[test]
+    fn walkback_frame_count_matches_walk_layout() {
+        // WalkBack uses the same 6×4 spritesheet grid as Walk.
+        assert_eq!(FEMALE_WALKBACK_FRAME_COUNT, FEMALE_WALK_FRAME_COUNT);
     }
 
     /// Single-click facing uses `dir_to_facing` with the grid delta from the
