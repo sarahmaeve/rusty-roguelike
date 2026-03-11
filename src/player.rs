@@ -7,7 +7,7 @@ use crate::{
     components::{CharacterKind, ChestContents, Door, DoorState, ItemKind, MainCamera, MapPosition, MapTile, Player, PropTile, StairsMidTile, StairsUpTile, YSort, YSortBias},
     inventory::{Inventory, SelectedSlot, UseItemEvent},
     log::GameMessage,
-    map::{spawn_floor_doors, spawn_floor_tiles, DoorRegistry, Dungeon, Map, TileType},
+    map::{spawn_floor_doors, spawn_floor_tiles, DoorRegistry, Dungeon, Map, TileType, VoidOutcome},
     ISO_STEP_X, ISO_STEP_Y, TILE_SCALE,
 };
 // wall_cast     → Map::is_walkable  (tile-level; props and doors do not block beams)
@@ -51,6 +51,12 @@ const FEMALE_WALK_FRAME_COUNT: usize = 24;
 const FEMALE_RUN_FRAME_COUNT: usize = 20;
 /// Frames in each Female idle spritesheet (4 columns × 4 rows).
 const FEMALE_IDLE_FRAME_COUNT: usize = 16;
+/// Frames in each Female jump spritesheet (6 columns × 4 rows, same grid as walk).
+const FEMALE_JUMP_FRAME_COUNT: usize = 24;
+/// Seconds per jump animation frame (≈25 fps).  The full arc plays in ~0.96 s.
+const FEMALE_JUMP_FRAME_SECS: f32 = 0.04;
+/// Peak height of the jump arc in world units (screen-space pixels at TILE_SCALE).
+const JUMP_ARC_HEIGHT: f32 = 60.0;
 /// Cell size of each Female spritesheet frame, in pixels.
 const FEMALE_CELL_PX: u32 = 256;
 /// Sprite anchor for the Female character.
@@ -198,12 +204,18 @@ struct FemaleSprites {
     run_body:    [Handle<Image>; FEMALE_DIR_COUNT],
     /// Shadow layer run sheets, one per direction.
     run_shadow:  [Handle<Image>; FEMALE_DIR_COUNT],
+    /// Body layer jump sheets, one per direction (6×4 grid, 256×256 px cells).
+    jump_body:   [Handle<Image>; FEMALE_DIR_COUNT],
+    /// Shadow layer jump sheets, one per direction.
+    jump_shadow: [Handle<Image>; FEMALE_DIR_COUNT],
     /// Shared atlas layout for all idle sheets (4 columns × 4 rows).
     idle_layout: Handle<TextureAtlasLayout>,
     /// Shared atlas layout for all walk sheets (6 columns × 4 rows).
     walk_layout: Handle<TextureAtlasLayout>,
     /// Shared atlas layout for all run sheets (5 columns × 4 rows).
     run_layout:  Handle<TextureAtlasLayout>,
+    /// Shared atlas layout for all jump sheets (6 columns × 4 rows, same as walk).
+    jump_layout: Handle<TextureAtlasLayout>,
 }
 
 #[derive(Component)]
@@ -229,6 +241,20 @@ struct PlayerAnimation {
     /// Fires to advance one tile along the path; duration adjusts per step
     /// between [`AUTO_WALK_STEP_SECS`] and [`AUTO_RUN_STEP_SECS`].
     step_timer: Timer,
+
+    // ── Jump state ────────────────────────────────────────────────────────────
+    /// True while a jump arc is in progress.  Blocks all other movement input.
+    jumping: bool,
+    /// The grid tile the jump will land on.
+    jump_target: (i32, i32),
+    /// Set to `true` once [`MapPosition`] has been updated to `jump_target`
+    /// (happens at the arc midpoint so the player snaps onto the landing tile
+    /// at the peak of the jump rather than at touchdown).
+    jump_midpoint_reached: bool,
+    /// Current frame index in the jump spritesheet (0 … [`FEMALE_JUMP_FRAME_COUNT`]-1).
+    jump_frame: usize,
+    /// Per-frame timer for the jump animation.
+    jump_frame_timer: Timer,
 }
 
 impl PlayerAnimation {
@@ -246,7 +272,25 @@ impl PlayerAnimation {
             path: Vec::new(),
             path_total: 0,
             step_timer: Timer::from_seconds(AUTO_WALK_STEP_SECS, TimerMode::Repeating),
+            jumping: false,
+            jump_target: (0, 0),
+            jump_midpoint_reached: false,
+            jump_frame: 0,
+            jump_frame_timer: Timer::from_seconds(FEMALE_JUMP_FRAME_SECS, TimerMode::Repeating),
         }
+    }
+
+    /// Begin a jump arc towards `target` (two tiles ahead in the facing direction).
+    /// Cancels any active auto-travel path and clears the running state.
+    fn trigger_jump(&mut self, target: (i32, i32)) {
+        self.jumping = true;
+        self.jump_target = target;
+        self.jump_midpoint_reached = false;
+        self.jump_frame = 0;
+        self.jump_frame_timer.reset();
+        // Clear motion state so idle resumes after landing.
+        self.running = false;
+        self.path.clear();
     }
 
     /// Keyboard step or auto-travel walk step: plays the walk animation.
@@ -478,6 +522,20 @@ fn spawn_player(
             FEMALE_ANGLES[i]
         ))
     });
+    let jump_body: [Handle<Image>; FEMALE_DIR_COUNT] = std::array::from_fn(|i| {
+        asset_server.load(format!(
+            "Characters/Female/Jump_Unarmed/Jump_Unarmed_Body_{:03}.png",
+            FEMALE_ANGLES[i]
+        ))
+    });
+    let jump_shadow: [Handle<Image>; FEMALE_DIR_COUNT] = std::array::from_fn(|i| {
+        asset_server.load(format!(
+            "Characters/Female/Jump_Unarmed/Jump_Unarmed_Shadow_{:03}.png",
+            FEMALE_ANGLES[i]
+        ))
+    });
+    // Jump sheets use the same 6×4 grid as the walk sheets.
+    let jump_layout = walk_layout.clone();
 
     let initial_dir = FacingDir::South.to_female_dir_index();
     let initial_body   = idle_body[initial_dir].clone();
@@ -490,9 +548,12 @@ fn spawn_player(
         walk_shadow,
         run_body,
         run_shadow,
+        jump_body,
+        jump_shadow,
         idle_layout: idle_layout.clone(),
         walk_layout: walk_layout.clone(),
         run_layout: run_layout.clone(),
+        jump_layout,
     };
 
     commands
@@ -597,6 +658,21 @@ fn facing_to_world_dir(facing: FacingDir) -> Vec2 {
     .normalize()
 }
 
+/// Convert a `FacingDir` to the grid delta (dx, dy) used for jump targeting.
+/// Diagonal facings produce diagonal deltas, giving 8-directional jump support.
+fn facing_to_grid_delta(facing: FacingDir) -> (i32, i32) {
+    match facing {
+        FacingDir::North     => ( 0, -1),
+        FacingDir::NorthEast => ( 1, -1),
+        FacingDir::East      => ( 1,  0),
+        FacingDir::SouthEast => ( 1,  1),
+        FacingDir::South     => ( 0,  1),
+        FacingDir::SouthWest => (-1,  1),
+        FacingDir::West      => (-1,  0),
+        FacingDir::NorthWest => (-1, -1),
+    }
+}
+
 // ── SystemParam bundles ───────────────────────────────────────────────────────
 
 /// Converts the cursor's screen position to isometric world-space.
@@ -651,6 +727,11 @@ fn player_movement(
     let Ok((mut pos, mut transform, mut anim)) = query.get_single_mut() else {
         return;
     };
+
+    // Movement is locked while a jump arc is in progress.
+    if anim.jumping {
+        return;
+    }
 
     let mut dx = 0_i32;
     let mut dy = 0_i32;
@@ -769,7 +850,7 @@ fn auto_step(
 ) {
     let Ok((mut pos, mut transform, mut anim)) = query.get_single_mut() else { return; };
 
-    if anim.path.is_empty() {
+    if anim.jumping || anim.path.is_empty() {
         return;
     }
 
@@ -828,6 +909,7 @@ fn animate_player(
     mut moving: ResMut<PlayerMoving>,
     mut player_q: Query<AnimatePlayerItem, With<Player>>,
     mut shadow_q: Query<&mut Sprite, (With<PlayerShadow>, Without<Player>)>,
+    mut jump_land_events: EventWriter<JumpLandedEvent>,
 ) {
     let Ok((mut sprite, mut anim, kind, male_sprites, female_sprites, children)) =
         player_q.get_single_mut()
@@ -866,6 +948,45 @@ fn animate_player(
         CharacterKind::Female => {
             let Some(sprites) = female_sprites else { return };
             let dir_i = anim.facing.to_female_dir_index();
+
+            // ── Jump animation (takes priority) ───────────────────────────────
+            if anim.jumping {
+                anim.jump_frame_timer.tick(time.delta());
+                if anim.jump_frame_timer.just_finished() {
+                    if anim.jump_frame + 1 >= FEMALE_JUMP_FRAME_COUNT {
+                        // Arc complete — let resolve_jump handle the landing.
+                        anim.jumping = false;
+                        anim.jump_frame = FEMALE_JUMP_FRAME_COUNT - 1;
+                        jump_land_events.send(JumpLandedEvent);
+                    } else {
+                        anim.jump_frame += 1;
+                    }
+                }
+
+                let body_img   = sprites.jump_body[dir_i].clone();
+                let shadow_img = sprites.jump_shadow[dir_i].clone();
+                let layout     = sprites.jump_layout.clone();
+
+                sprite.image = body_img;
+                if let Some(atlas) = &mut sprite.texture_atlas {
+                    atlas.layout = layout.clone();
+                    atlas.index  = anim.jump_frame;
+                }
+                if let Some(children) = children {
+                    for &child in children.iter() {
+                        if let Ok(mut shadow_sprite) = shadow_q.get_mut(child) {
+                            shadow_sprite.image = shadow_img.clone();
+                            if let Some(atlas) = &mut shadow_sprite.texture_atlas {
+                                atlas.layout = layout.clone();
+                                atlas.index  = anim.jump_frame;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+
+            // ── Normal idle / walk / run animation ────────────────────────────
 
             // Advance the frame timer for all states — idle is also a 16-frame
             // animated loop, unlike the Male single-frame idle.
@@ -1271,6 +1392,171 @@ fn execute_level_transition(
     }
 }
 
+// ── Event: jump landed ────────────────────────────────────────────────────────
+
+/// Fired by [`animate_player`] when a jump animation completes.
+/// Consumed by [`on_jump_land`] to apply any [`VoidOutcome`].
+#[derive(Event)]
+struct JumpLandedEvent;
+
+// ── Update system: J key triggers a jump ──────────────────────────────────────
+
+/// Press **J** to jump two tiles in the current facing direction.
+///
+/// The intermediate tile is vaulted over regardless of its type.
+/// Landing is allowed on any walkable tile or [`TileType::Void`]; solid walls
+/// and closed doors cannot be landed on.  The jump can be performed over any
+/// tile (including floors, props, and void gaps) as long as the landing is valid.
+fn trigger_jump_system(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    dungeon: Res<Dungeon>,
+    doors: DoorParams<'_, '_>,
+    mut player_q: Query<(&MapPosition, &mut PlayerAnimation), With<Player>>,
+    mut log: EventWriter<GameMessage>,
+) {
+    if !keyboard.just_pressed(KeyCode::KeyJ) {
+        return;
+    }
+    let Ok((pos, mut anim)) = player_q.get_single_mut() else { return; };
+
+    // No chained jumps.
+    if anim.jumping {
+        return;
+    }
+
+    let (dx, dy) = facing_to_grid_delta(anim.facing);
+    let land_x = pos.x + dx * 2;
+    let land_y = pos.y + dy * 2;
+
+    let map = dungeon.current_map();
+    if !map.in_bounds(land_x, land_y) {
+        log.send(GameMessage::new("Nothing to jump to."));
+        return;
+    }
+
+    let land_tile = map.tiles[map.idx(land_x, land_y)];
+
+    // Void is always a valid (if dangerous) landing.
+    // Walkable + no prop + no closed door → normal landing.
+    // Everything else (solid walls, closed doors) → blocked.
+    let can_land = land_tile == TileType::Void
+        || (map.is_passable(land_x, land_y) && !doors.is_closed_at((land_x, land_y)));
+
+    if !can_land {
+        log.send(GameMessage::new("Can't jump there."));
+        return;
+    }
+
+    anim.trigger_jump((land_x, land_y));
+}
+
+// ── Update system: apply jump arc to Transform ────────────────────────────────
+
+/// Applies the parabolic jump arc to the player's world transform each frame.
+///
+/// Runs after [`animate_player`] so `jump_frame` is already updated.
+/// At the arc midpoint (frame ≥ half of total) the [`MapPosition`] is snapped
+/// to the landing tile so the player's depth-sort and light position track the
+/// correct destination during the descent.
+fn apply_jump_arc(
+    mut player_q: Query<(&mut MapPosition, &mut Transform, &mut PlayerAnimation), With<Player>>,
+) {
+    let Ok((mut pos, mut transform, mut anim)) = player_q.get_single_mut() else { return; };
+
+    if !anim.jumping {
+        return;
+    }
+
+    // Snap MapPosition to the landing tile at the arc midpoint.
+    if !anim.jump_midpoint_reached
+        && anim.jump_frame >= FEMALE_JUMP_FRAME_COUNT / 2
+    {
+        anim.jump_midpoint_reached = true;
+        let (tx, ty) = anim.jump_target;
+        pos.x = tx;
+        pos.y = ty;
+    }
+
+    let base = pos.to_world(0.0);
+    let t = anim.jump_frame as f32 / (FEMALE_JUMP_FRAME_COUNT - 1) as f32;
+    let arc = JUMP_ARC_HEIGHT * 4.0 * t * (1.0 - t);
+    transform.translation.x = base.x;
+    transform.translation.y = base.y + arc;
+}
+
+// ── Update system: handle jump landing ───────────────────────────────────────
+
+/// Consumes [`JumpLandedEvent`] and applies the [`VoidOutcome`] if the player
+/// has landed on a [`TileType::Void`] cell.
+fn on_jump_land(
+    mut events: EventReader<JumpLandedEvent>,
+    dungeon: Res<Dungeon>,
+    mut player_q: Query<(&mut MapPosition, &mut Transform, &mut PlayerAnimation), With<Player>>,
+    mut log: EventWriter<GameMessage>,
+    mut level_transition: EventWriter<LevelTransition>,
+    mut app_exit: EventWriter<AppExit>,
+) {
+    for _ in events.read() {
+        let Ok((mut pos, mut transform, mut anim)) = player_q.get_single_mut() else { continue };
+
+        let map = dungeon.current_map();
+        if !map.in_bounds(pos.x, pos.y) {
+            continue;
+        }
+        if map.tiles[map.idx(pos.x, pos.y)] != TileType::Void {
+            continue;
+        }
+
+        let outcome = map
+            .void_outcomes
+            .get(&(pos.x, pos.y))
+            .cloned()
+            .unwrap_or(VoidOutcome::Hazard { damage: 10 });
+
+        match outcome {
+            VoidOutcome::NextFloor => {
+                let next = dungeon.current_floor + 1;
+                if next < dungeon.floors.len() {
+                    let landing = dungeon.floors[next].rooms[0].center();
+                    log.send(GameMessage::alert("You fall through to the next level!"));
+                    level_transition.send(LevelTransition {
+                        destination_floor: next,
+                        exit_pos: landing,
+                    });
+                } else {
+                    log.send(GameMessage::alert("You fall into the abyss…"));
+                    app_exit.send(AppExit::Success);
+                }
+            }
+            VoidOutcome::Hazard { damage } => {
+                let msg = format!("You fall into a pit! (-{damage} HP)");
+                log.send(GameMessage::alert(msg));
+                // Respawn at the first room centre of the current floor.
+                let (rx, ry) = map.rooms[0].center();
+                pos.x = rx;
+                pos.y = ry;
+                let world = pos.to_world(0.0);
+                transform.translation.x = world.x;
+                transform.translation.y = world.y;
+                anim.facing = FacingDir::South;
+            }
+            VoidOutcome::Warp { floor, pos: (wx, wy) } => {
+                log.send(GameMessage::alert("You fall through a dimensional rift!"));
+                level_transition.send(LevelTransition {
+                    destination_floor: floor,
+                    exit_pos: (wx, wy),
+                });
+            }
+            VoidOutcome::Terminal => {
+                log.send(GameMessage::alert(
+                    "You fall into the abyss… and are lost forever.",
+                ));
+                app_exit.send(AppExit::Success);
+            }
+        }
+    }
+}
+
 // ── Update system: hide map tiles outside the player's light envelope ─────────
 
 /// Hides every `MapTile` that falls outside the player's current light
@@ -1348,14 +1634,18 @@ impl Plugin for PlayerPlugin {
         app.init_resource::<PlayerMoving>()
             .init_resource::<ClickState>()
             .add_event::<LevelTransition>()
+            .add_event::<JumpLandedEvent>()
             .add_systems(Startup, spawn_player)
             .add_systems(
                 Update,
                 (
                     player_movement,
                     handle_mouse_click,
+                    trigger_jump_system.after(player_movement),
                     auto_step.after(player_movement),
-                    animate_player,
+                    animate_player.after(trigger_jump_system),
+                    apply_jump_arc.after(animate_player),
+                    on_jump_land.after(apply_jump_arc),
                     interact_with_stairs,
                     execute_level_transition.after(interact_with_stairs),
                     interact_with_chests.after(interact_with_stairs),
@@ -1590,5 +1880,68 @@ mod tests {
     fn lantern_base_radius_equals_light_radius() {
         let radius = cull_base_radius(LightType::Lantern, LANTERN_RADIUS);
         assert_eq!(radius, LANTERN_RADIUS);
+    }
+
+    // ── Jump mechanic ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn facing_to_grid_delta_cardinals() {
+        assert_eq!(facing_to_grid_delta(FacingDir::North), ( 0, -1));
+        assert_eq!(facing_to_grid_delta(FacingDir::East),  ( 1,  0));
+        assert_eq!(facing_to_grid_delta(FacingDir::South), ( 0,  1));
+        assert_eq!(facing_to_grid_delta(FacingDir::West),  (-1,  0));
+    }
+
+    #[test]
+    fn facing_to_grid_delta_diagonals() {
+        assert_eq!(facing_to_grid_delta(FacingDir::NorthEast), ( 1, -1));
+        assert_eq!(facing_to_grid_delta(FacingDir::SouthEast), ( 1,  1));
+        assert_eq!(facing_to_grid_delta(FacingDir::SouthWest), (-1,  1));
+        assert_eq!(facing_to_grid_delta(FacingDir::NorthWest), (-1, -1));
+    }
+
+    #[test]
+    fn jump_arc_peaks_at_midpoint() {
+        // The parabola 4·t·(1-t) peaks at t = 0.5 with value 1.0.
+        let mid_t = 0.5_f32;
+        let arc = JUMP_ARC_HEIGHT * 4.0 * mid_t * (1.0 - mid_t);
+        assert!((arc - JUMP_ARC_HEIGHT).abs() < 1e-5, "arc should peak at JUMP_ARC_HEIGHT");
+    }
+
+    #[test]
+    fn jump_arc_zero_at_endpoints() {
+        for t in [0.0_f32, 1.0_f32] {
+            let arc = JUMP_ARC_HEIGHT * 4.0 * t * (1.0 - t);
+            assert!(arc.abs() < 1e-5, "arc at t={t} should be 0, got {arc}");
+        }
+    }
+
+    #[test]
+    fn jump_arc_height_is_positive() {
+        assert!(JUMP_ARC_HEIGHT > 0.0);
+    }
+
+    #[test]
+    fn jump_frame_count_matches_walk_layout() {
+        // Jump uses the same 6×4 spritesheet grid as Walk.
+        assert_eq!(FEMALE_JUMP_FRAME_COUNT, FEMALE_WALK_FRAME_COUNT);
+    }
+
+    #[test]
+    fn player_animation_starts_not_jumping() {
+        let anim = PlayerAnimation::new();
+        assert!(!anim.jumping);
+    }
+
+    #[test]
+    fn trigger_jump_sets_jumping_state() {
+        let mut anim = PlayerAnimation::new();
+        anim.trigger_jump((5, 7));
+        assert!(anim.jumping);
+        assert_eq!(anim.jump_target, (5, 7));
+        assert!(!anim.jump_midpoint_reached);
+        assert_eq!(anim.jump_frame, 0);
+        assert!(anim.path.is_empty(), "trigger_jump must clear auto-travel path");
+        assert!(!anim.running, "trigger_jump must clear running state");
     }
 }

@@ -15,6 +15,26 @@ const MIN_ROOM_SIZE: i32 = 3;
 const MAX_ROOM_SIZE: i32 = 8;
 const NUM_DUNGEON_FLOORS: usize = 3;
 
+// ── Void outcome ──────────────────────────────────────────────────────────────
+
+/// What happens when the player lands on a [`TileType::Void`] tile.
+///
+/// Stored per-cell in [`Map::void_outcomes`].  Cells absent from the map use
+/// a default [`VoidOutcome::Hazard`] when the player lands on them.
+#[derive(Clone, Debug)]
+pub enum VoidOutcome {
+    /// Immediately descend one dungeon floor, landing at that floor's first
+    /// room centre.
+    NextFloor,
+    /// Deal `damage` to the player and respawn them at the first room centre
+    /// of the current floor.
+    Hazard { damage: i32 },
+    /// Warp the player directly to an exact floor and grid position.
+    Warp { floor: usize, pos: (i32, i32) },
+    /// End the run — the player cannot be recovered.
+    Terminal,
+}
+
 // ── Tile type ─────────────────────────────────────────────────────────────────
 
 /// The base type of a map cell.  Determines rendering and tile-level walkability
@@ -34,6 +54,10 @@ pub enum TileType {
     BrokenWall,
     /// Wall with a window opening; uses `stoneWallWindow_*` sprites.
     Window,
+    /// Open pit or chasm — impassable on foot.  A single-tile void can be
+    /// jumped over with **J**.  Landing on a void triggers the per-cell
+    /// [`VoidOutcome`] stored in [`Map::void_outcomes`].  No sprite is spawned.
+    Void,
 
     // ── Walkable floors ───────────────────────────────────────────────────────
     /// Standard stone floor — four random variants (`stone_N/E/S/W`).
@@ -289,6 +313,9 @@ pub struct Map {
     /// Items stored inside closed chests, keyed by grid position.
     /// Tuple: (item kind, sprite facing direction for the open-chest asset).
     pub chest_items: HashMap<(i32, i32), (ItemKind, CardinalDir)>,
+    /// Per-cell outcomes for [`TileType::Void`] tiles.  Absent entries use a
+    /// default [`VoidOutcome::Hazard`] when the player lands on them.
+    pub void_outcomes: HashMap<(i32, i32), VoidOutcome>,
 }
 
 impl Map {
@@ -303,6 +330,7 @@ impl Map {
             rooms: Vec::new(),
             stair_links: HashMap::new(),
             chest_items: HashMap::new(),
+            void_outcomes: HashMap::new(),
         }
     }
 
@@ -414,8 +442,90 @@ pub fn generate_map() -> Map {
 
     place_test_door(&mut map);
     place_test_chest(&mut map);
+    place_test_voids(&mut map);
 
     map
+}
+
+/// Carves a single-tile [`TileType::Void`] at the midpoint of the corridor
+/// between two rooms, and registers `outcome` for that cell.
+/// Does nothing if the midpoint tile is not a floor tile.
+fn place_single_void(map: &mut Map, room_a: usize, room_b: usize, outcome: VoidOutcome) {
+    if map.rooms.len() <= room_b {
+        return;
+    }
+    let (ax, ay) = map.rooms[room_a].center();
+    let (bx, by) = map.rooms[room_b].center();
+    let mid_x = (ax + bx) / 2;
+    let mid_y = (ay + by) / 2;
+    if !map.in_bounds(mid_x, mid_y) {
+        return;
+    }
+    let idx = map.idx(mid_x, mid_y);
+    if map.tiles[idx] != TileType::Floor {
+        return;
+    }
+    map.tiles[idx] = TileType::Void;
+    map.void_outcomes.insert((mid_x, mid_y), outcome);
+}
+
+/// Carves a bridge gap across the corridor between two rooms.
+///
+/// The gap spans three tiles perpendicular to the dominant corridor axis.
+/// The centre tile is converted to [`TileType::Bridge`] (walkable); the two
+/// flanking tiles become [`TileType::Void`] with a `Hazard` outcome.  This
+/// forces the player to use the narrow bridge or jump the side voids.
+fn place_bridge_gap(map: &mut Map, room_a: usize, room_b: usize) {
+    if map.rooms.len() <= room_b {
+        return;
+    }
+    let (ax, ay) = map.rooms[room_a].center();
+    let (bx, by) = map.rooms[room_b].center();
+    let mid_x = (ax + bx) / 2;
+    let mid_y = (ay + by) / 2;
+
+    // Choose the axis along which to stripe voids: perpendicular to the
+    // dominant travel direction.
+    let mostly_horizontal = (bx - ax).abs() >= (by - ay).abs();
+
+    let offsets: [(i32, i32); 3] = if mostly_horizontal {
+        // Corridor runs L-R → stripe is vertical (same x, vary y)
+        [(0, -1), (0, 0), (0, 1)]
+    } else {
+        // Corridor runs U-D → stripe is horizontal (vary x, same y)
+        [(-1, 0), (0, 0), (1, 0)]
+    };
+
+    for (i, (dx, dy)) in offsets.iter().enumerate() {
+        let gx = mid_x + dx;
+        let gy = mid_y + dy;
+        if !map.in_bounds(gx, gy) {
+            continue;
+        }
+        let idx = map.idx(gx, gy);
+        if map.tiles[idx] != TileType::Floor {
+            continue;
+        }
+        if i == 1 {
+            // Centre tile → bridge
+            map.tiles[idx] = TileType::Bridge;
+        } else {
+            // Flanking tiles → void
+            map.tiles[idx] = TileType::Void;
+            map.void_outcomes
+                .insert((gx, gy), VoidOutcome::Hazard { damage: 10 });
+        }
+    }
+}
+
+/// Places test void features on the map:
+/// - A single-tile hazard void in the corridor between room 0 and room 1.
+/// - A bridge gap in the corridor between room 1 and room 2 (if available).
+fn place_test_voids(map: &mut Map) {
+    place_single_void(map, 0, 1, VoidOutcome::Hazard { damage: 5 });
+    if map.rooms.len() >= 3 {
+        place_bridge_gap(map, 1, 2);
+    }
 }
 
 /// Generates a multi-floor dungeon linked by a single staircase shaft.
@@ -553,7 +663,12 @@ pub fn spawn_floor_tiles(commands: &mut Commands, map: &Map, asset_server: &Asse
 
             let tile = map.tiles[map.idx(x, y)];
 
-            if tile.is_floor_like() {
+            if tile == TileType::Void {
+                // ── Void ──────────────────────────────────────────────────────
+                // No sprite — the pit renders as open darkness surrounded by
+                // whatever walls or floors border it.
+                continue;
+            } else if tile.is_floor_like() {
                 // ── Floor ─────────────────────────────────────────────────────
                 let dir = DIRS[rng.gen_range(0..4)];
                 let image = asset_server
@@ -950,8 +1065,68 @@ mod tests {
             TileType::DoorClosed,
             TileType::BrokenWall,
             TileType::Window,
+            TileType::Void,
         ] {
             assert!(!t.is_walkable(), "{t:?} should not be walkable");
+        }
+    }
+
+    // ── TileType::Void ────────────────────────────────────────────────────────
+
+    #[test]
+    fn void_is_not_floor_like() {
+        assert!(!TileType::Void.is_floor_like());
+    }
+
+    #[test]
+    fn void_is_not_occluding_wall() {
+        assert!(!TileType::Void.is_occluding_wall());
+    }
+
+    #[test]
+    fn void_is_not_stair() {
+        assert!(!TileType::Void.is_stair());
+    }
+
+    #[test]
+    fn place_test_voids_carves_at_least_one_void() {
+        let map = generate_map();
+        let void_count = map
+            .tiles
+            .iter()
+            .filter(|&&t| t == TileType::Void)
+            .count();
+        assert!(void_count >= 1, "generate_map must produce at least one Void tile");
+    }
+
+    #[test]
+    fn void_tiles_have_outcomes() {
+        let map = generate_map();
+        for y in 0..map.height {
+            for x in 0..map.width {
+                if map.tiles[map.idx(x, y)] == TileType::Void {
+                    // Every Void tile must have a registered outcome.
+                    assert!(
+                        map.void_outcomes.contains_key(&(x, y)),
+                        "Void tile at ({x},{y}) has no VoidOutcome"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn void_tiles_are_not_passable() {
+        let map = generate_map();
+        for y in 0..map.height {
+            for x in 0..map.width {
+                if map.tiles[map.idx(x, y)] == TileType::Void {
+                    assert!(
+                        !map.is_passable(x, y),
+                        "Void tile at ({x},{y}) must not be passable"
+                    );
+                }
+            }
         }
     }
 
